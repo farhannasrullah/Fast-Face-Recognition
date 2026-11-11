@@ -2,6 +2,7 @@
 Dashboard Admin Absensi Wajah - gaya UI selaras dengan chat RAG (netral hangat, aksen ungu).
 
 Halaman  : Ringkasan | Kamera absen (built-in di browser) | Kelola wajah (CRUD) | Rekap
+Tema     : Otomatis (ikut sistem) / Terang / Gelap, pilihan tersimpan di browser.
 Membaca/menulis absensi.csv dan faces_db.npz milik main.py (letakkan di folder yang sama).
 
 Jalankan : python dashboard.py
@@ -83,9 +84,11 @@ def build(date):
     recap = {}
     for d, j, n in rows:
         per_day.setdefault(d, set()).add(n)
-        r = recap.setdefault(n, {"nama": n, "total": 0, "last": ""})
+        r = recap.setdefault(n, {"nama": n, "total": 0, "days": 0, "last": ""})
         r["total"] += 1
         r["last"] = max(r["last"], f"{d} {j}")
+    for r in recap.values():           # jumlah hari berbeda tempat orang ini tercatat hadir
+        r["days"] = sum(1 for s in per_day.values() if r["nama"] in s)
 
     total = len(registered)
     return {
@@ -95,6 +98,7 @@ def build(date):
         "absent": [n for n in registered if n not in here],
         "pct": min(100, round(100 * len(here) / total)) if total else 0,
         "trend": [{"date": d, "count": len(per_day.get(d, ()))} for d in days],
+        "work_days": len(per_day),
         "recap": sorted(recap.values(), key=lambda r: (-r["total"], r["nama"])),
         "updated": datetime.now().strftime("%H:%M:%S"),
     }
@@ -375,31 +379,42 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Absensi Wajah · Admin</title>
+<script>try{var t=localStorage.getItem('theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{color-scheme:light dark;--bg:#faf9f7;--side:#f3f1ec;--panel:#ffffff;--ink:#1f1d1a;--mute:#5c574f;--line:#e5e0d8;--acc:#7c3aed;--soft:#efe8fd;--on-acc:#ffffff;--ok:#15803d;--ok-soft:#dcf3e3;--bad:#b42318;--bad-soft:#fde4e1;--shadow:0 1px 2px rgba(31,29,26,.06),0 8px 24px rgba(31,29,26,.07)}
-@media (prefers-color-scheme:dark){:root{--bg:#1b1916;--side:#22201c;--panel:#2a2723;--ink:#f1ede6;--mute:#b3ab9f;--line:#3a362f;--acc:#a78bfa;--soft:#352b52;--on-acc:#1b1916;--ok:#6ee7a0;--ok-soft:#1f3a2a;--bad:#f97066;--bad-soft:#40201d;--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28)}}
+/* tema: terang (bawaan) | gelap | otomatis mengikuti sistem (tanpa atribut data-theme) */
+:root{color-scheme:light;--bg:#faf9f7;--side:#f3f1ec;--panel:#ffffff;--ink:#1f1d1a;--mute:#5c574f;--line:#e5e0d8;--acc:#7c3aed;--acc2:#c4a5fb;--soft:#efe8fd;--on-acc:#ffffff;--ok:#15803d;--ok-soft:#dcf3e3;--warn:#b45309;--warn-soft:#fdecc8;--bad:#b42318;--bad-soft:#fde4e1;--shadow:0 1px 2px rgba(31,29,26,.06),0 8px 24px rgba(31,29,26,.07)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#1b1916;--side:#22201c;--panel:#2a2723;--ink:#f1ede6;--mute:#b3ab9f;--line:#3a362f;--acc:#a78bfa;--acc2:#6d3fd6;--soft:#352b52;--on-acc:#1b1916;--ok:#6ee7a0;--ok-soft:#1f3a2a;--warn:#fbbf24;--warn-soft:#3d2f12;--bad:#f97066;--bad-soft:#40201d;--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28)}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#1b1916;--side:#22201c;--panel:#2a2723;--ink:#f1ede6;--mute:#b3ab9f;--line:#3a362f;--acc:#a78bfa;--acc2:#6d3fd6;--soft:#352b52;--on-acc:#1b1916;--ok:#6ee7a0;--ok-soft:#1f3a2a;--warn:#fbbf24;--warn-soft:#3d2f12;--bad:#f97066;--bad-soft:#40201d;--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28)}
+/* token layout: satu skala jarak, radius, dan tinggi kontrol dipakai di seluruh halaman */
+:root{--s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:20px;--s6:24px;--s7:32px;--gap:16px;--pad:20px;--r-card:20px;--r-inner:14px;--r-ctl:10px;--ctl:38px}
+@media (max-width:600px){:root{--gap:12px;--pad:16px}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+p{margin:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;transition:background .2s,color .2s}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .app{display:grid;grid-template-columns:264px minmax(0,1fr);min-height:100vh}
 
 /* sidebar */
-.side{background:var(--side);border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
-.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 16px;font-weight:700;font-size:16px}
+.side{background:var(--side);border-right:1px solid var(--line);padding:var(--s5) var(--s4);display:flex;flex-direction:column;gap:var(--s1);position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:var(--s3);padding:var(--s1) var(--s3) var(--s5);font-weight:700;font-size:16px}
 .logo{width:34px;height:34px;border-radius:11px;background:var(--acc);color:var(--on-acc);display:grid;place-items:center}
-.nav{display:flex;flex-direction:column;gap:2px}
-.nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;color:var(--mute);text-decoration:none;font-weight:500}
+.nav{display:flex;flex-direction:column;gap:var(--s1)}
+.nav a{display:flex;align-items:center;gap:var(--s3);height:var(--ctl);padding:0 var(--s3);border-radius:var(--r-ctl);color:var(--mute);text-decoration:none;font-weight:500}
 .nav a:hover{background:color-mix(in srgb,var(--acc) 7%,transparent)}
 .nav a.on{background:var(--soft);color:var(--acc);font-weight:650}
-.sfoot{margin-top:auto;padding:12px 8px 0;border-top:1px solid var(--line);font-size:13px;color:var(--mute)}
-.sfoot label{display:block;margin-bottom:10px}
-.sfoot input{margin-top:4px;width:100%}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mute);margin-right:6px}
+.sfoot{margin-top:auto;padding:var(--s4) var(--s3) 0;border-top:1px solid var(--line);font-size:13px;color:var(--mute)}
+.sfoot label{display:block;margin-bottom:var(--s3)}
+.sfoot input{margin-top:var(--s1);width:100%}
+.seg{display:flex;gap:var(--s1);padding:var(--s1);border:1px solid var(--line);border-radius:var(--r-ctl);background:var(--panel);margin-bottom:var(--s3)}
+.seg button{flex:1;display:grid;place-items:center;height:30px;border:0;border-radius:7px;background:transparent;color:var(--mute);cursor:pointer}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed=true]{background:var(--soft);color:var(--acc)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mute);margin-right:var(--s2)}
 .dot.on{background:var(--ok)}
 .top{display:none}
 .scrim{display:none}
@@ -408,95 +423,137 @@ body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Plus Jakarta
   .side{position:fixed;inset:0 auto 0 0;width:282px;transform:translateX(-102%);transition:transform .25s;z-index:30;height:100dvh}
   .side.open{transform:none;box-shadow:var(--shadow)}
   .scrim.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:20}
-  .top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;font-weight:700}
+  .top{display:flex;align-items:center;gap:var(--s3);height:56px;padding:0 var(--s4);background:var(--bg);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;font-weight:700}
 }
 
-/* konten */
-.main{padding:36px clamp(16px,4vw,48px) 56px;max-width:1120px;margin:0 auto}
-.hello{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;justify-content:space-between;margin-bottom:22px}
-h1{font-family:Lora,Georgia,serif;font-weight:500;font-size:clamp(26px,4vw,36px);line-height:1.2;margin:0}
-.sub{margin:6px 0 0;color:var(--mute)}
-h2{margin:0 0 12px;font-size:16px;font-weight:650}
+/* kerangka halaman */
+.main{padding:var(--s7) clamp(16px,4vw,48px) 56px;max-width:1120px;margin:0 auto}
+.hello{display:flex;flex-wrap:wrap;gap:var(--gap);align-items:flex-end;justify-content:space-between;margin-bottom:var(--s6)}
+h1{font-family:Lora,Georgia,serif;font-weight:500;font-size:clamp(26px,4vw,34px);line-height:1.2;margin:0}
+.sub{margin-top:var(--s1);color:var(--mute)}
+h2{margin:0;font-size:16px;line-height:1.3;font-weight:650}
 .mute{color:var(--mute)}
-input,select,.btn{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:7px 12px}
+.meta{color:var(--mute);font-size:13px;white-space:nowrap}
+.note{margin-bottom:var(--gap)}
+.note:empty{display:none}
+.err{color:var(--bad)}.okmsg{color:var(--ok)}
+
+/* kontrol: tinggi seragam */
+input,select,.btn{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:var(--r-ctl);height:var(--ctl);padding:0 var(--s3)}
 input::placeholder{color:var(--mute)}
-.btn{display:inline-flex;align-items:center;gap:8px;text-decoration:none;cursor:pointer}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);text-decoration:none;cursor:pointer;white-space:nowrap}
 .btn:hover{border-color:var(--acc)}
 button.btn:disabled{opacity:.5;cursor:not-allowed}
 .btn.pri{background:var(--acc);border-color:var(--acc);color:var(--on-acc);font-weight:600}
-.btn.sm{padding:3px 10px;font-size:13px;border-radius:8px}
+.btn.sm{height:30px;padding:0 var(--s3);font-size:13px;border-radius:8px}
 .btn.bad{color:var(--bad);border-color:var(--bad)}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:var(--shadow)}
 
-/* kartu saran (seperti saran pertanyaan di chat) */
-.sugs{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 2px 14px;margin:0 -2px 8px}
-.sug{flex:1 0 230px;scroll-snap-align:start;display:flex;gap:12px;align-items:center;padding:14px 16px;border:1px solid var(--line);border-radius:16px;background:var(--panel);color:var(--ink);text-decoration:none;font-weight:600;cursor:pointer;font-family:inherit;font-size:14px;text-align:left}
+/* kartu: satu pola (padding, radius, header) untuk semua */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-card);padding:var(--pad);box-shadow:var(--shadow);min-width:0}
+.card-h{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);min-height:var(--ctl);margin-bottom:var(--s3)}
+.card-h input{width:min(190px,55%)}
+
+/* saran cepat: sejajar dengan grid di bawahnya */
+.sugs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--gap);margin-bottom:var(--gap)}
+.sug{display:flex;gap:var(--s3);align-items:center;padding:var(--s3) var(--s4);border:1px solid var(--line);border-radius:var(--r-inner);background:var(--panel);color:var(--ink);text-decoration:none;font-weight:600;cursor:pointer;font-size:14px;text-align:left;min-width:0}
 .sug:hover{border-color:var(--acc);background:var(--soft)}
 .sug .ico{width:36px;height:36px;border-radius:11px;background:var(--soft);color:var(--acc);display:grid;place-items:center;flex:none}
-.sug small{display:block;color:var(--mute);font-weight:400}
+.sug small{display:block;color:var(--mute);font-weight:400;line-height:1.35}
+@media (max-width:760px){.sugs{grid-auto-flow:column;grid-template-columns:none;grid-auto-columns:minmax(230px,80%);overflow-x:auto;scroll-snap-type:x mandatory}.sug{scroll-snap-align:start}}
 
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-.stat{padding:16px 18px;border-radius:18px;background:var(--panel);border:1px solid var(--line)}
-.stat b{display:block;font-size:30px;line-height:1.1;font-weight:650;font-variant-numeric:tabular-nums}
-.stat span{color:var(--mute);font-size:13px}
-.meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:10px}
-.meter i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
-.cols{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:18px;align-items:start}
-@media (max-width:900px){.cols{grid-template-columns:1fr}}
-.cols>div>.card+.card{margin-top:18px}
-.head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
-.head h2{margin:0}
+/* grid bento: ring utama > statistik > daftar */
+.bento{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--gap)}
+.hero{grid-column:span 5;grid-row:span 2;display:flex;flex-direction:column;background:linear-gradient(165deg,var(--soft) 0%,var(--panel) 62%)}
+.hero-body{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:var(--s2)}
+.ringbig{position:relative;width:min(220px,100%);aspect-ratio:1;margin-bottom:var(--s2)}
+.ringbig svg{position:absolute;inset:0;width:100%;height:100%}
+.ringbig .mid{position:absolute;inset:0;display:grid;place-content:center}
+.ringbig b{font-family:Lora,Georgia,serif;font-weight:500;font-size:clamp(40px,6vw,52px);line-height:1;font-variant-numeric:tabular-nums}
+.ringbig small{color:var(--mute);font-size:13px}
+.hero .cap{font-size:16px;font-weight:650}
+.hero .last{font-size:13px;color:var(--mute)}
+.rot{transform:rotate(-90deg)}
+.rt{fill:none;stroke:var(--line)}
+.rp{fill:none;stroke:var(--acc);stroke-linecap:round;transition:stroke-dasharray .9s cubic-bezier(.2,.8,.2,1),opacity .2s}
+#h-arc{stroke:url(#g1)}
+.trio{grid-column:span 7;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--gap)}
+.stat{display:flex;flex-direction:column;align-items:flex-start}
+.stat b{display:block;font-size:28px;line-height:1.1;font-weight:650;font-variant-numeric:tabular-nums;margin-top:var(--s3)}
+.stat .l{color:var(--mute);font-size:13px;margin-top:var(--s1)}
+.st-ic{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:var(--soft);color:var(--acc)}
+.st-ic.ok{background:var(--ok-soft);color:var(--ok)}
+.st-ic.warn{background:var(--warn-soft);color:var(--warn)}
+.weekc{grid-column:span 7}
+.week{display:flex;justify-content:space-between;gap:var(--s2)}
+.wd{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:var(--s1);font-size:12px;line-height:1.3;color:var(--mute)}
+.wd .mr{margin-bottom:var(--s1)}
+.wd .rp{stroke:color-mix(in srgb,var(--acc) 50%,transparent)}
+.wd.sel .rp{stroke:var(--acc)}
+.wd.sel{color:var(--ink);font-weight:600}
+.c7{grid-column:span 7}
+.c5{grid-column:span 5}
+@media (max-width:1000px){.hero,.trio,.weekc,.c7,.c5{grid-column:1/-1;grid-row:auto}}
+@media (max-width:520px){.st-ic{display:none}.stat b{margin-top:0}}
+
+/* cincin mini */
+.mr{position:relative;display:inline-grid;place-items:center;width:var(--s);height:var(--s);flex:none}
+.mr svg{position:absolute;inset:0;width:100%;height:100%}
+.mr i{position:relative;font-style:normal;font-weight:650;font-size:calc(var(--s)*.3);font-variant-numeric:tabular-nums}
+.mr.ok .rp{stroke:var(--ok)}
+.mr.warn .rp{stroke:var(--warn)}
+.mr.low .rp{stroke:var(--bad)}
+
+/* tabel */
 table{width:100%;border-collapse:collapse}
-td,th{padding:9px 6px;border-bottom:1px solid var(--line);text-align:left}
+th,td{padding:var(--s3) var(--s2);border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+th:first-child,td:first-child{padding-left:0}
+th:last-child,td:last-child{padding-right:0}
 tr:last-child td{border-bottom:0}
-th{font-size:13px;color:var(--mute);font-weight:500}
+th{font-size:13px;color:var(--mute);font-weight:500;position:sticky;top:0;background:var(--panel);z-index:1}
 .num{font-variant-numeric:tabular-nums;white-space:nowrap}
-.scroll{max-height:400px;overflow:auto}
+.scroll{max-height:340px;overflow:auto}
+.scroll.tall{max-height:none}
 .act{text-align:right;white-space:nowrap}
-.who{display:flex;align-items:center;gap:10px}
+.who{display:flex;align-items:center;gap:var(--s3)}
 .av{width:30px;height:30px;border-radius:50%;background:var(--soft);color:var(--acc);display:grid;place-items:center;font-weight:700;font-size:13px;flex:none}
-.chip{display:inline-block;margin:0 6px 6px 0;padding:3px 12px;border-radius:999px;background:var(--soft);color:var(--acc);font-size:14px}
-.trend{display:flex;gap:8px;align-items:flex-end}
-.bar{flex:1;text-align:center;font-size:12px;color:var(--mute);font-variant-numeric:tabular-nums}
-.fill{height:96px;display:flex;align-items:flex-end}
-.fill i{display:block;width:100%;min-height:2px;background:var(--soft);border-radius:5px 5px 0 0}
-.bar.sel .fill i{background:var(--acc)}
-.bar.sel{color:var(--ink);font-weight:600}
-.err{color:var(--bad)}.okmsg{color:var(--ok)}
-.bar2{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:14px}
+#absent{display:flex;flex-wrap:wrap;gap:var(--s2)}
+.chip{display:inline-block;padding:var(--s1) var(--s3);border-radius:999px;background:var(--soft);color:var(--acc);font-size:14px}
+.pcell{display:flex;align-items:center;gap:var(--s3)}
 
 /* kamera */
-.camgrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:18px;align-items:start}
+.camgrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:var(--gap);align-items:start}
 @media (max-width:900px){.camgrid{grid-template-columns:1fr}}
-.stage{position:relative;background:#0f0e0c;border-radius:24px;overflow:hidden;aspect-ratio:16/9;box-shadow:var(--shadow)}
+.stage{position:relative;background:#0f0e0c;border-radius:var(--r-card);overflow:hidden;aspect-ratio:16/9;box-shadow:var(--shadow)}
 .stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%}
 .stage video{object-fit:contain;transform:scaleX(-1)}
 .stage:fullscreen{border-radius:0;aspect-ratio:auto}
-.idle{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:#e9e4da;padding:20px}
-.idle .logo{margin:0 auto 12px;width:52px;height:52px;border-radius:16px}
-.pill{position:absolute;top:14px;left:14px;max-width:calc(100% - 28px);padding:6px 14px;border-radius:999px;background:rgba(20,18,15,.62);color:#fff;font-size:13px;font-weight:600;backdrop-filter:blur(8px)}
+.idle{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:#e9e4da;padding:var(--s5)}
+.idle .logo{margin:0 auto var(--s3);width:52px;height:52px;border-radius:16px}
+.pill{position:absolute;top:var(--s4);left:var(--s4);max-width:calc(100% - 32px);padding:var(--s2) var(--s4);border-radius:999px;background:rgba(20,18,15,.62);color:#fff;font-size:13px;font-weight:600;backdrop-filter:blur(8px)}
 .pill.err{background:rgba(180,35,24,.85);color:#fff}
-.toast{position:absolute;left:50%;bottom:18px;transform:translate(-50%,12px);opacity:0;transition:.25s;display:flex;gap:10px;align-items:center;padding:8px 18px 8px 8px;border-radius:999px;background:var(--panel);color:var(--ink);box-shadow:var(--shadow);font-weight:600;white-space:nowrap;max-width:94%}
+.toast{position:absolute;left:50%;bottom:var(--s4);transform:translate(-50%,12px);opacity:0;transition:.25s;display:flex;gap:var(--s3);align-items:center;padding:var(--s2) var(--s5) var(--s2) var(--s2);border-radius:999px;background:var(--panel);color:var(--ink);box-shadow:var(--shadow);font-weight:600;white-space:nowrap;max-width:94%}
 .toast.show{opacity:1;transform:translate(-50%,0)}
-.ctrl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}
+.ctrl{display:flex;flex-wrap:wrap;gap:var(--s3);align-items:center;margin-top:var(--gap)}
 .ctrl select{max-width:240px}
-.feed{display:flex;flex-direction:column;gap:12px}
-.feed .row2{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.tips{margin:14px 0 0;padding:0;list-style:none;color:var(--mute);font-size:13px}
-.tips li+li{margin-top:4px}
+.feed{display:flex;flex-direction:column;gap:var(--s3)}
+.feed .row2{display:flex;justify-content:space-between;align-items:center;gap:var(--s3)}
+.camsum{display:flex;align-items:center;gap:var(--s4);padding-bottom:var(--s4);margin-bottom:var(--s4);border-bottom:1px solid var(--line)}
+.camsum b{display:block;font-size:16px}
+.tips{margin:var(--s4) 0 0;padding:var(--s4) 0 0;border-top:1px solid var(--line);list-style:none;color:var(--mute);font-size:13px}
+.tips li+li{margin-top:var(--s1)}
 
 /* dialog */
-dialog{border:1px solid var(--line);border-radius:22px;background:var(--panel);color:var(--ink);padding:22px;width:min(560px,94vw);box-shadow:var(--shadow)}
+dialog{border:1px solid var(--line);border-radius:var(--r-card);background:var(--panel);color:var(--ink);padding:var(--s6);width:min(560px,94vw);box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
-dialog h2{margin-top:0;font-family:Lora,Georgia,serif;font-weight:500;font-size:22px}
-dialog label:not(.btn){display:block;margin:0 0 10px}
-dialog input:not([type=file]){display:block;width:100%;margin-top:4px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
-.row.end{justify-content:flex-end;margin-top:16px}
-video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
-.thumbs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+dialog h2{margin:0 0 var(--s4);font-family:Lora,Georgia,serif;font-weight:500;font-size:22px}
+dialog label:not(.btn){display:block;margin:0 0 var(--s3);font-size:13.5px;font-weight:500}
+dialog input:not([type=file]){display:block;width:100%;margin-top:var(--s1);font-weight:400}
+.row{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin:var(--s2) 0}
+.row.end{justify-content:flex-end;margin-top:var(--s5)}
+video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner)}
+.thumbs{display:flex;flex-wrap:wrap;gap:var(--s2);margin:var(--s2) 0}
 .th{position:relative}
-.th img{width:64px;height:64px;object-fit:cover;border-radius:10px;display:block}
+.th img{width:64px;height:64px;object-fit:cover;border-radius:var(--r-ctl);display:block}
 .th button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;padding:0;border-radius:50%;border:0;background:var(--bad);color:#fff;cursor:pointer}
 </style>
 </head>
@@ -508,15 +565,20 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
 <div class="scrim" id="scrim"></div>
 <div class="app">
   <aside class="side" id="side">
-    <div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="9" r="4"/><path d="M4.5 20c1-4 4-6 7.5-6s6.500 2 7.500 6"/></svg></span>Absensi Wajah</div>
+    <div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="9" r="4"/><path d="M4.5 20c1-4 4-6 7.5-6s6.5 2 7.5 6"/></svg></span>Absensi Wajah</div>
     <nav class="nav">
       <a href="#ringkasan" id="n-ringkasan"><svg class="ic" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h14V10"/></svg>Ringkasan</a>
-      <a href="#kamera" id="n-kamera"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg>Kamera absen</a>
-      <a href="#kelola" id="n-kelola"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.500"/><path d="M2.500 20c.8-3.600 3.400-5.500 6.500-5.500s5.700 1.900 6.500 5.500M16 5a3.500 3.500 0 010 7M18 14.800c1.900.7 3.200 2.500 3.500 5.200"/></svg>Kelola wajah</a>
+      <a href="#kamera" id="n-kamera"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Kamera absen</a>
+      <a href="#kelola" id="n-kelola"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5M16 5a3.5 3.5 0 010 7M18 14.8c1.9.7 3.2 2.5 3.5 5.2"/></svg>Kelola wajah</a>
       <a href="#rekap" id="n-rekap"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Rekap kehadiran</a>
     </nav>
     <div class="sfoot">
       <label id="pinbox" hidden>PIN admin <input type="password" id="pin" autocomplete="off"></label>
+      <div class="seg" role="group" aria-label="Tema tampilan">
+        <button type="button" data-theme-btn="auto" title="Otomatis (ikut sistem)" aria-label="Tema otomatis"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
+        <button type="button" data-theme-btn="light" title="Terang" aria-label="Tema terang"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></svg></button>
+        <button type="button" data-theme-btn="dark" title="Gelap" aria-label="Tema gelap"><svg class="ic" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z"/></svg></button>
+      </div>
       <span class="dot" id="dot"></span><span id="status">Menghubungkan...</span>
     </div>
   </aside>
@@ -529,25 +591,44 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
         <label class="mute">Tanggal <input type="date" id="date"></label>
       </div>
       <div class="sugs">
-        <a class="sug" href="#kamera"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg></span><span>Buka kamera absen<small>Pindai wajah langsung di sini</small></span></a>
+        <a class="sug" href="#kamera"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg></span><span>Buka kamera absen<small>Pindai wajah langsung di sini</small></span></a>
         <a class="sug" href="#kelola" id="q-add"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span><span>Tambah orang baru<small>Daftarkan wajah dengan foto atau kamera</small></span></a>
         <a class="sug" href="#" id="export"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg></span><span>Unduh CSV<small>Absensi pada tanggal terpilih</small></span></a>
       </div>
-      <div class="stats">
-        <div class="stat"><b id="s-hadir">0</b><span>Sudah hadir</span></div>
-        <div class="stat"><b id="s-belum">0</b><span>Belum hadir</span></div>
-        <div class="stat"><b id="s-total">0</b><span>Wajah terdaftar</span></div>
-        <div class="stat"><b id="s-pct">0%</b><span>Tingkat kehadiran</span><div class="meter" role="img" aria-label="Persentase kehadiran"><i id="meter"></i></div></div>
-      </div>
-      <div class="cols">
-        <div class="card">
-          <div class="head"><h2>Kedatangan terbaru</h2><input type="search" id="q" placeholder="Cari nama" aria-label="Cari nama"></div>
+
+      <div class="bento">
+        <div class="card hero">
+          <div class="card-h"><h2 id="h-title">Kehadiran hari ini</h2></div>
+          <div class="hero-body">
+          <div class="ringbig" role="img" aria-label="Persentase kehadiran">
+            <svg viewBox="0 0 120 120" class="rot">
+              <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" style="stop-color:var(--acc2)"/><stop offset="1" style="stop-color:var(--acc)"/></linearGradient></defs>
+              <circle class="rt" cx="60" cy="60" r="50" pathLength="100" style="stroke-width:11"/>
+              <circle class="rp" id="h-arc" cx="60" cy="60" r="50" pathLength="100" stroke-dasharray="0 100" style="stroke-width:11;opacity:0"/>
+            </svg>
+            <div class="mid"><b id="s-pct">0%</b><small>hadir</small></div>
+          </div>
+          <p class="cap" id="h-cap">Memuat...</p>
+          <p class="last" id="h-last"></p>
+          </div>
+        </div>
+
+        <div class="trio">
+          <div class="card stat"><span class="st-ic ok"><svg class="ic" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><b id="s-hadir">0</b><span class="l">Sudah hadir</span></div>
+          <div class="card stat"><span class="st-ic warn"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg></span><b id="s-belum">0</b><span class="l">Belum hadir</span></div>
+          <div class="card stat"><span class="st-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5M16 5a3.5 3.5 0 010 7M18 14.8c1.9.7 3.2 2.5 3.5 5.2"/></svg></span><b id="s-total">0</b><span class="l">Wajah terdaftar</span></div>
+        </div>
+
+        <div class="card weekc">
+          <div class="card-h"><h2>7 hari terakhir</h2><span class="meta">Orang hadir per hari</span></div>
+          <div class="week" id="trend"></div>
+        </div>
+
+        <div class="card c7">
+          <div class="card-h"><h2>Kedatangan terbaru</h2><input type="search" id="q" placeholder="Cari nama" aria-label="Cari nama"></div>
           <div class="scroll"><table><thead><tr><th>Nama</th><th>Jam</th></tr></thead><tbody id="present"></tbody></table></div>
         </div>
-        <div>
-          <div class="card"><h2>Belum hadir</h2><div id="absent"></div></div>
-          <div class="card"><h2>7 hari terakhir</h2><div class="trend" id="trend"></div></div>
-        </div>
+        <div class="card c5"><div class="card-h"><h2>Belum hadir</h2><span class="meta" id="a-count"></span></div><div id="absent"></div></div>
       </div>
     </section>
 
@@ -561,7 +642,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
           <div class="stage" id="stage">
             <video id="c-video" playsinline muted></video>
             <canvas id="c-canvas"></canvas>
-            <div class="idle" id="c-idle"><div><span class="logo"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg></span>Kamera belum aktif<br><span class="mute">Tekan Mulai kamera untuk memulai absen otomatis</span></div></div>
+            <div class="idle" id="c-idle"><div><span class="logo"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg></span>Kamera belum aktif<br><span class="mute">Tekan Mulai kamera untuk memulai absen otomatis</span></div></div>
             <div class="pill" id="c-pill" hidden></div>
             <div class="toast" id="c-toast"></div>
           </div>
@@ -572,8 +653,8 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
           </div>
         </div>
         <div class="card">
-          <h2>Baru saja hadir</h2>
-          <p class="mute" id="c-count" style="margin:-6px 0 12px"></p>
+          <div class="card-h"><h2>Baru saja hadir</h2></div>
+          <div class="camsum"><span id="c-ring"></span><div><b id="c-num"></b><span class="mute" id="c-count"></span></div></div>
           <div class="feed" id="c-feed"></div>
           <ul class="tips">
             <li>Jarak ideal 0,5 sampai 2 meter dari kamera.</li>
@@ -590,8 +671,10 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
         <div><h1>Kelola wajah</h1><p class="sub">Tambah, ubah, atau hapus wajah terdaftar. Foto tidak disimpan, hanya data pengenal wajah (embedding).</p></div>
         <button class="btn pri" id="k-add" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Tambah orang</button>
       </div>
-      <p id="k-msg" role="status"></p>
-      <div class="card"><div class="scroll"><table>
+      <p id="k-msg" role="status" class="note"></p>
+      <div class="card">
+        <div class="card-h"><h2>Orang terdaftar</h2><span class="meta" id="k-count"></span></div>
+        <div class="scroll tall"><table>
         <thead><tr><th>Nama</th><th>ID</th><th>Sampel</th><th></th></tr></thead>
         <tbody id="k-rows"></tbody>
       </table></div></div>
@@ -600,11 +683,12 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
     <!-- REKAP -->
     <section id="v-rekap" hidden>
       <div class="hello">
-        <div><h1>Rekap kehadiran</h1><p class="sub">Total hari hadir setiap orang berdasarkan absensi.csv.</p></div>
-        <input type="search" id="r-q" placeholder="Cari nama" aria-label="Cari nama">
+        <div><h1>Rekap kehadiran</h1><p class="sub" id="r-sub">Persentase = hari hadir dibanding total hari yang punya catatan absensi.</p></div>
       </div>
-      <div class="card"><div class="scroll" style="max-height:none"><table>
-        <thead><tr><th>Nama</th><th>Total catatan</th><th>Terakhir hadir</th></tr></thead>
+      <div class="card">
+        <div class="card-h"><h2>Per orang</h2><input type="search" id="r-q" placeholder="Cari nama" aria-label="Cari nama"></div>
+        <div class="scroll tall"><table>
+        <thead><tr><th>Nama</th><th>Kehadiran</th><th>Total catatan</th><th>Terakhir hadir</th></tr></thead>
         <tbody id="recap"></tbody>
       </table></div></div>
     </section>
@@ -653,6 +737,26 @@ const pinHeader = () => { const p = sessionStorage.getItem('pin'); return p ? {'
 $('pin').value = sessionStorage.getItem('pin') || '';
 $('pin').addEventListener('input', e => sessionStorage.setItem('pin', e.target.value));
 
+// ---------- tema ----------
+function applyTheme(t, save) {
+  const el = document.documentElement;
+  if (t === 'light' || t === 'dark') el.dataset.theme = t; else { delete el.dataset.theme; t = 'auto'; }
+  document.querySelectorAll('[data-theme-btn]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themeBtn === t)));
+  if (save) { try { t === 'auto' ? localStorage.removeItem('theme') : localStorage.setItem('theme', t); } catch (e) { /* abaikan */ } }
+}
+document.querySelectorAll('[data-theme-btn]').forEach(b => b.onclick = () => applyTheme(b.dataset.themeBtn, true));
+applyTheme(document.documentElement.dataset.theme || 'auto');
+
+// ---------- cincin progres ----------
+function ring(pct, size, sw, label, cls) {
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  return `<span class="mr ${cls || ''}" style="--s:${size}px" role="img" aria-label="${p}%"><svg class="rot" viewBox="0 0 100 100">` +
+    `<circle class="rt" cx="50" cy="50" r="42" pathLength="100" style="stroke-width:${sw}"/>` +
+    `<circle class="rp" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${p} 100" style="stroke-width:${sw}${p ? '' : ';opacity:0'}"/></svg>` +
+    `<i>${label}</i></span>`;
+}
+const tone = p => p >= 80 ? 'ok' : p >= 50 ? 'warn' : 'low';
+
 // ---------- navigasi ----------
 function closeNav() { $('side').classList.remove('open'); $('scrim').classList.remove('open'); }
 $('menu').onclick = () => { $('side').classList.add('open'); $('scrim').classList.add('open'); };
@@ -698,22 +802,30 @@ function draw() {
 
 function drawSummary() {
   const n = data.present.length, t = data.registered;
-  const label = new Date(dateEl.value + 'T00:00').toLocaleDateString('id-ID', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
+  const d = new Date(dateEl.value + 'T00:00');
+  const label = d.toLocaleDateString('id-ID', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
   $('greet').textContent = greeting() + ', Admin';
-  $('s-sub').textContent = t ? `${label}. ${n} dari ${t} orang sudah hadir.` : `${label}. Belum ada wajah terdaftar, tambahkan lewat Kelola wajah.`;
+  $('s-sub').textContent = label + '.' + (t ? '' : ' Belum ada wajah terdaftar, tambahkan lewat Kelola wajah.');
+  $('h-title').textContent = dateEl.value === today() ? 'Kehadiran hari ini' : 'Kehadiran ' + d.toLocaleDateString('id-ID', {day: 'numeric', month: 'short'});
+  $('s-pct').textContent = data.pct + '%';
+  const arc = $('h-arc');
+  arc.setAttribute('stroke-dasharray', data.pct + ' 100'); arc.style.opacity = data.pct ? 1 : 0;
+  $('h-cap').textContent = t ? `${n} dari ${t} orang sudah hadir` : 'Belum ada wajah terdaftar';
+  $('h-last').textContent = n ? `Terakhir: ${data.present[0].nama} pukul ${data.present[0].jam}` : 'Belum ada kedatangan';
   $('s-hadir').textContent = n;
   $('s-belum').textContent = t ? data.absent.length : '-';
   $('s-total').textContent = t;
-  $('s-pct').textContent = data.pct + '%';
-  $('meter').style.width = data.pct + '%';
+  $('a-count').textContent = t ? `${data.absent.length} orang` : '';
   drawPresent();
   $('absent').innerHTML = !t ? '<p class="mute">Daftar belum tersedia.</p>'
     : data.absent.length ? data.absent.map(x => `<span class="chip">${esc(x)}</span>`).join('')
     : '<p class="mute">Semua orang terdaftar sudah hadir.</p>';
-  const max = Math.max(1, ...data.trend.map(x => x.count));
-  $('trend').innerHTML = data.trend.map((x, i) =>
-    `<div class="bar${i === data.trend.length - 1 ? ' sel' : ''}"><div>${x.count}</div>` +
-    `<div class="fill"><i style="height:${x.count / max * 100}%"></i></div><div>${x.date.slice(5)}</div></div>`).join('');
+  const den = t || Math.max(1, ...data.trend.map(x => x.count));
+  $('trend').innerHTML = data.trend.map((x, i) => {
+    const dd = new Date(x.date + 'T00:00');
+    return `<div class="wd${i === data.trend.length - 1 ? ' sel' : ''}">${ring(100 * x.count / den, 46, 12, x.count)}` +
+      `<span>${esc(dd.toLocaleDateString('id-ID', {weekday: 'short'}))}</span><span>${dd.getDate()}</span></div>`;
+  }).join('');
 }
 
 function drawPresent() {
@@ -726,15 +838,22 @@ function drawPresent() {
 
 function drawRecap() {
   const q = $('r-q').value.trim().toLowerCase();
+  const wd = Math.max(1, data.work_days || 0);
+  $('r-sub').textContent = `Persentase = hari hadir dibanding ${data.work_days || 0} hari yang punya catatan absensi.`;
   const rows = data.recap.filter(r => r.nama.toLowerCase().includes(q));
-  $('recap').innerHTML = rows.map(r =>
-    `<tr><td><div class="who"><span class="av">${esc(ini(r.nama))}</span>${esc(r.nama)}</div></td><td class="num">${r.total}</td><td class="num">${esc(r.last)}</td></tr>`).join('')
-    || '<tr><td colspan="3" class="mute">Belum ada data absensi.</td></tr>';
+  $('recap').innerHTML = rows.map(r => {
+    const p = Math.min(100, Math.round(100 * r.days / wd));
+    return `<tr><td><div class="who"><span class="av">${esc(ini(r.nama))}</span>${esc(r.nama)}</div></td>` +
+      `<td><div class="pcell">${ring(p, 42, 12, p + '%', tone(p))}<span class="mute num">${r.days} hari</span></div></td>` +
+      `<td class="num">${r.total}</td><td class="num">${esc(r.last)}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="mute">Belum ada data absensi.</td></tr>';
 }
 
 function drawFeed() {
   const n = data.present.length, t = data.registered;
-  $('c-count').textContent = t ? `${n} dari ${t} orang hadir hari ini` : `${n} orang hadir hari ini`;
+  $('c-ring').innerHTML = ring(data.pct, 64, 11, data.pct + '%', 'ok');
+  $('c-num').textContent = t ? `${n} dari ${t} orang` : `${n} orang`;
+  $('c-count').textContent = 'hadir hari ini';
   $('c-feed').innerHTML = data.present.slice(0, 8).map(p =>
     `<div class="row2"><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div><span class="mute num">${esc(p.jam)}</span></div>`).join('')
     || '<p class="mute">Belum ada yang hadir.</p>';
@@ -865,7 +984,7 @@ let mode = null, target = null, imgs = [], stream = null, busy = false;
 const PROMPTS = ['Hadap lurus', 'Tengok sedikit ke kiri', 'Tengok sedikit ke kanan', 'Dongak sedikit',
                  'Tunduk sedikit', 'Hadap lurus, rileks', 'Senyum tipis', 'Hadap lurus'];
 
-function say(t, err) { const m = $('k-msg'); m.textContent = t; m.className = err ? 'err' : 'okmsg'; }
+function say(t, err) { const m = $('k-msg'); m.textContent = t; m.className = 'note ' + (err ? 'err' : 'okmsg'); }
 
 async function api(method, path, body) {
   const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', ...pinHeader()}, body: JSON.stringify(body)});
@@ -880,6 +999,7 @@ async function loadPeople() {
   } catch (e) { say('Server tidak terjangkau', true); return; }
   $('pinbox').hidden = !info.pin_required;
   $('k-add').disabled = !info.editable;
+  $('k-count').textContent = `${info.people.length} orang`;
   $('k-rows').innerHTML = info.people.map((p, i) =>
     `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td>${esc(p.id) || '<span class="mute">-</span>'}</td><td class="num">${p.sampel}</td>` +
     `<td class="act"><button class="btn sm" data-a="samples" data-i="${i}">Tambah sampel</button> ` +
