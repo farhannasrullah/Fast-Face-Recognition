@@ -1,0 +1,6 @@
+opencv-python>=4.8.0,<5
+numpy>=1.23
+
+# Opsional
+psutil>=5.9      # menampilkan estimasi RAM di layar
+openpyxl>=3.1    # ekspor rekap ke Excel (.xlsx)
