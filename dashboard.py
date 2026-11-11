@@ -1,14 +1,19 @@
 """
-Dashboard Absensi Wajah - ringan. Tab 'Kelola wajah': tambah, ubah, dan hapus wajah (CRUD).
-Membaca absensi.csv dan faces_db.npz milik main.py (letakkan di folder yang sama).
+Dashboard Admin Absensi Wajah - gaya UI selaras dengan chat RAG (netral hangat, aksen ungu).
+
+Halaman  : Ringkasan | Kamera absen (built-in di browser) | Kelola wajah (CRUD) | Rekap
+Membaca/menulis absensi.csv dan faces_db.npz milik main.py (letakkan di folder yang sama).
 
 Jalankan : python dashboard.py
 Buka     : http://127.0.0.1:8000  (otomatis terbuka di browser)
 Opsi     : --port 8000
            --host 0.0.0.0   (agar bisa dibuka dari HP/PC lain di jaringan yang sama)
            --no-browser     (jangan buka browser otomatis)
-           --pin 1234       (wajib jika dibuka dari jaringan agar wajah bisa dikelola; dikirim lewat HTTP biasa)
-Boleh berjalan bersamaan dengan mode run: perubahan wajah dimuat ulang otomatis oleh mode run.
+           --pin 1234       (wajib jika dibuka dari jaringan agar kamera absen dan pengelolaan wajah aktif)
+
+Kamera absen memakai kamera browser. Browser hanya mengizinkan kamera di localhost atau HTTPS,
+jadi untuk perangkat lain di jaringan gunakan HTTPS (mis. reverse proxy) atau buka dari komputer ini.
+Boleh berjalan bersamaan dengan 'main.py run': perubahan wajah dimuat ulang otomatis.
 """
 import argparse
 import base64
@@ -19,6 +24,7 @@ import json
 import os
 import sys
 import threading
+import time
 import webbrowser
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -94,15 +100,22 @@ def build(date):
     }
 
 
-# ----------------------------- Kelola wajah (CRUD) -----------------------------
+# ----------------------------- Kelola wajah (CRUD) + kamera absen -----------------------------
 JSON = "application/json; charset=utf-8"
 MIN_SAMPLES = 3            # minimal foto valid untuk orang baru
 MAX_IMAGES = 12            # maksimal foto per permintaan
 MAX_BODY = 40 * 1024 * 1024
+MAX_FRAME = 4 * 1024 * 1024
 PIN = ""                   # diisi dari --pin
 EDIT_ENABLED = True        # False jika dashboard terbuka di jaringan tanpa --pin
 EDIT_LOCK = threading.Lock()
+ENGINE_LOCK = threading.Lock()   # model OpenCV tidak aman dipakai bersamaan
+SCAN_LOCK = threading.Lock()
+SCAN_MIN_FACE_PX = 56      # lebar wajah minimum (px, pada frame kiriman browser)
+SCAN_STREAK_GAP = 2.5      # detik maksimum antar kecocokan beruntun
+RECHECK_LOG = 5.0          # jeda cek ulang catatan absen untuk orang yang sama
 _core = {}
+_streak, _checked = {}, {}
 
 
 class ApiError(Exception):
@@ -207,7 +220,8 @@ def process_images(images):
     good, rejected = [], []
     for i, d in enumerate(images, 1):
         try:
-            good.append(embed_image(main, engine, d))
+            with ENGINE_LOCK:
+                good.append(embed_image(main, engine, d))
         except ValueError as e:
             rejected.append(f"foto {i}: {e}")
     return good, rejected
@@ -279,6 +293,78 @@ def api_delete(d):
     return {"message": f"{name} dihapus ({removed} sampel). Riwayat absensi tidak ikut terhapus."}
 
 
+# ----------------------------- Kamera absen (frame dari browser) -----------------------------
+def scan_db(main):
+    """Database untuk pemindaian; dimuat ulang otomatis bila file berubah."""
+    db = _core.get("db")
+    if db is None:
+        db = _core["db"] = main.Database(DB_FILE)
+    elif db.changed():
+        db.reload()
+    return db
+
+
+def log_once(main, name, pid, score, now, events):
+    """Catat absen sesuai aturan cooldown main.py. Kembalikan 'tercatat' atau 'hadir'."""
+    chk = _checked.get(name)
+    if chk and now - chk[0] < RECHECK_LOG:
+        return chk[1]
+    lg = main.AttendanceLogger()        # baca ulang CSV agar sinkron dengan 'main.py run'
+    dt = datetime.now()
+    if lg.should_log(name, dt):
+        lg.log(name, pid, score, dt)
+        events.append({"nama": name, "id": pid, "jam": dt.strftime("%H:%M:%S")})
+        print(f"[ABSEN] {dt:%Y-%m-%d %H:%M:%S}  {name}  (skor {score:.2f}, kamera web)")
+        status = "tercatat"
+    else:
+        status = "hadir"
+    _checked[name] = (now, status)
+    return status
+
+
+def api_scan(raw):
+    main, engine = get_main(), get_engine()
+    np, cv2 = main.np, main.cv2
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ApiError(400, "Frame bukan gambar yang valid.")
+    h, w = img.shape[:2]
+    sw = min(w, 640)
+    sh = max(1, round(h * sw / w))
+    small = img if sw == w else cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+    scale = (w / sw, h / sh)
+    faces_out, events = [], []
+    with SCAN_LOCK:
+        db = scan_db(main)
+        found = []
+        with ENGINE_LOCK:
+            for row in engine.detect(small):
+                big = row[2] * scale[0] >= SCAN_MIN_FACE_PX
+                found.append((row, engine.embed(img, row, scale) if big else None))
+        now = time.time()
+        for k in [k for k, v in _streak.items() if now - v[1] > SCAN_STREAK_GAP]:
+            del _streak[k]
+        for row, emb in found:
+            box = [float(row[0] / sw), float(row[1] / sh), float(row[2] / sw), float(row[3] / sh)]
+            if emb is None:
+                faces_out.append({"box": box, "status": "far"})
+                continue
+            name, pid, score = db.match(emb)
+            if name is None or score < main.MATCH_THRESH:
+                faces_out.append({"box": box, "status": "unknown", "skor": round(score, 2)})
+                continue
+            st = _streak.get(name)
+            n = st[0] + 1 if st else 1
+            _streak[name] = (n, now)
+            if n < main.CONFIRM_MATCHES:
+                faces_out.append({"box": box, "status": "cek", "nama": name, "skor": round(score, 2)})
+                continue
+            status = log_once(main, name, pid, score, now, events)
+            faces_out.append({"box": box, "status": status, "nama": name, "skor": round(score, 2)})
+        db_empty = db.is_empty()
+    return {"faces": faces_out, "events": events, "db_empty": db_empty}
+
+
 ROUTES = {("POST", "/api/people"): api_create, ("POST", "/api/people/samples"): api_add_samples,
           ("PUT", "/api/people"): api_update, ("DELETE", "/api/people"): api_delete}
 
@@ -288,132 +374,243 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dashboard Absensi Wajah</title>
+<title>Absensi Wajah · Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{color-scheme:light dark;--bg:#f3f4f1;--panel:#fbfbf9;--ink:#1c2024;--mute:#646b73;--line:#dcdfd8;--ok:#0b6e8a;--ok-soft:#cfe6ed;--late:#9a4d00;--late-soft:#f6e3c8}
-@media (prefers-color-scheme:dark){:root{--bg:#15181b;--panel:#1b1f23;--ink:#e6e9ec;--mute:#98a0a8;--line:#2c3237;--ok:#5cc3de;--ok-soft:#1d3a44;--late:#f0b765;--late-soft:#3b2d17}}
+:root{color-scheme:light dark;--bg:#faf9f7;--side:#f3f1ec;--panel:#ffffff;--ink:#1f1d1a;--mute:#5c574f;--line:#e5e0d8;--acc:#7c3aed;--soft:#efe8fd;--on-acc:#ffffff;--ok:#15803d;--ok-soft:#dcf3e3;--bad:#b42318;--bad-soft:#fde4e1;--shadow:0 1px 2px rgba(31,29,26,.06),0 8px 24px rgba(31,29,26,.07)}
+@media (prefers-color-scheme:dark){:root{--bg:#1b1916;--side:#22201c;--panel:#2a2723;--ink:#f1ede6;--mute:#b3ab9f;--line:#3a362f;--acc:#a78bfa;--soft:#352b52;--on-acc:#1b1916;--ok:#6ee7a0;--ok-soft:#1f3a2a;--bad:#f97066;--bad-soft:#40201d;--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28)}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
-.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
-header{border-bottom:1px solid var(--line);background:var(--panel)}
-header .wrap{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding-top:14px;padding-bottom:14px}
-.brand{font-weight:650;font-size:16px}
-.ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-input,.btn{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;text-decoration:none}
-:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.app{display:grid;grid-template-columns:264px minmax(0,1fr);min-height:100vh}
+
+/* sidebar */
+.side{background:var(--side);border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 16px;font-weight:700;font-size:16px}
+.logo{width:34px;height:34px;border-radius:11px;background:var(--acc);color:var(--on-acc);display:grid;place-items:center}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;color:var(--mute);text-decoration:none;font-weight:500}
+.nav a:hover{background:color-mix(in srgb,var(--acc) 7%,transparent)}
+.nav a.on{background:var(--soft);color:var(--acc);font-weight:650}
+.sfoot{margin-top:auto;padding:12px 8px 0;border-top:1px solid var(--line);font-size:13px;color:var(--mute)}
+.sfoot label{display:block;margin-bottom:10px}
+.sfoot input{margin-top:4px;width:100%}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mute);margin-right:6px}
 .dot.on{background:var(--ok)}
-.live{color:var(--mute);font-size:13px}
-.sum{padding:28px 0 20px}
-.sum h1{margin:0;font-size:30px;line-height:1.2;font-weight:600;font-variant-numeric:tabular-nums}
-.sum p{margin:4px 0 14px;color:var(--mute)}
-.meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden}
-.meter i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s}
-.grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:32px;padding-bottom:28px}
-@media (max-width:760px){.grid{grid-template-columns:1fr;gap:24px}}
-section{min-width:0}
-h2{margin:0 0 10px;font-size:16px;font-weight:650}
-.head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+.top{display:none}
+.scrim{display:none}
+@media (max-width:860px){
+  .app{display:block}
+  .side{position:fixed;inset:0 auto 0 0;width:282px;transform:translateX(-102%);transition:transform .25s;z-index:30;height:100dvh}
+  .side.open{transform:none;box-shadow:var(--shadow)}
+  .scrim.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:20}
+  .top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;font-weight:700}
+}
+
+/* konten */
+.main{padding:36px clamp(16px,4vw,48px) 56px;max-width:1120px;margin:0 auto}
+.hello{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;justify-content:space-between;margin-bottom:22px}
+h1{font-family:Lora,Georgia,serif;font-weight:500;font-size:clamp(26px,4vw,36px);line-height:1.2;margin:0}
+.sub{margin:6px 0 0;color:var(--mute)}
+h2{margin:0 0 12px;font-size:16px;font-weight:650}
+.mute{color:var(--mute)}
+input,select,.btn{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:7px 12px}
+input::placeholder{color:var(--mute)}
+.btn{display:inline-flex;align-items:center;gap:8px;text-decoration:none;cursor:pointer}
+.btn:hover{border-color:var(--acc)}
+button.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.pri{background:var(--acc);border-color:var(--acc);color:var(--on-acc);font-weight:600}
+.btn.sm{padding:3px 10px;font-size:13px;border-radius:8px}
+.btn.bad{color:var(--bad);border-color:var(--bad)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:var(--shadow)}
+
+/* kartu saran (seperti saran pertanyaan di chat) */
+.sugs{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 2px 14px;margin:0 -2px 8px}
+.sug{flex:1 0 230px;scroll-snap-align:start;display:flex;gap:12px;align-items:center;padding:14px 16px;border:1px solid var(--line);border-radius:16px;background:var(--panel);color:var(--ink);text-decoration:none;font-weight:600;cursor:pointer;font-family:inherit;font-size:14px;text-align:left}
+.sug:hover{border-color:var(--acc);background:var(--soft)}
+.sug .ico{width:36px;height:36px;border-radius:11px;background:var(--soft);color:var(--acc);display:grid;place-items:center;flex:none}
+.sug small{display:block;color:var(--mute);font-weight:400}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.stat{padding:16px 18px;border-radius:18px;background:var(--panel);border:1px solid var(--line)}
+.stat b{display:block;font-size:30px;line-height:1.1;font-weight:650;font-variant-numeric:tabular-nums}
+.stat span{color:var(--mute);font-size:13px}
+.meter{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:10px}
+.meter i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
+.cols{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:18px;align-items:start}
+@media (max-width:900px){.cols{grid-template-columns:1fr}}
+.cols>div>.card+.card{margin-top:18px}
+.head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
 .head h2{margin:0}
 table{width:100%;border-collapse:collapse}
-td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
+td,th{padding:9px 6px;border-bottom:1px solid var(--line);text-align:left}
+tr:last-child td{border-bottom:0}
 th{font-size:13px;color:var(--mute);font-weight:500}
 .num{font-variant-numeric:tabular-nums;white-space:nowrap}
-.scroll{max-height:380px;overflow:auto}
-.chip{display:inline-block;margin:0 6px 6px 0;padding:2px 10px;border-radius:999px;background:var(--late-soft);color:var(--late);font-size:14px}
-.mute{color:var(--mute)}
-.trend{display:flex;gap:8px;align-items:flex-end;margin-top:6px}
+.scroll{max-height:400px;overflow:auto}
+.act{text-align:right;white-space:nowrap}
+.who{display:flex;align-items:center;gap:10px}
+.av{width:30px;height:30px;border-radius:50%;background:var(--soft);color:var(--acc);display:grid;place-items:center;font-weight:700;font-size:13px;flex:none}
+.chip{display:inline-block;margin:0 6px 6px 0;padding:3px 12px;border-radius:999px;background:var(--soft);color:var(--acc);font-size:14px}
+.trend{display:flex;gap:8px;align-items:flex-end}
 .bar{flex:1;text-align:center;font-size:12px;color:var(--mute);font-variant-numeric:tabular-nums}
 .fill{height:96px;display:flex;align-items:flex-end}
-.fill i{display:block;width:100%;min-height:2px;background:var(--ok-soft);border-radius:3px 3px 0 0}
-.bar.sel .fill i{background:var(--ok)}
+.fill i{display:block;width:100%;min-height:2px;background:var(--soft);border-radius:5px 5px 0 0}
+.bar.sel .fill i{background:var(--acc)}
 .bar.sel{color:var(--ink);font-weight:600}
-.side>section+section{margin-top:28px}
-footer{border-top:1px solid var(--line);padding:16px 0 40px}
-
-:root{--bad:#b42318;--on-ok:#fff}
-@media (prefers-color-scheme:dark){:root{--bad:#f97066;--on-ok:#0b1d24}}
-[hidden]{display:none!important}
-.tabs{display:flex;gap:4px}
-.tabs a{padding:5px 12px;border-radius:6px;color:var(--mute);text-decoration:none}
-.tabs a.on{background:var(--bg);color:var(--ink);font-weight:600}
-button.btn,label.btn{cursor:pointer}
-button.btn:disabled{opacity:.5;cursor:not-allowed}
-.btn.pri{background:var(--ok);border-color:var(--ok);color:var(--on-ok)}
-.btn.sm{padding:2px 8px;font-size:13px}
-.btn.bad{color:var(--bad);border-color:var(--bad)}
-.bar2{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:12px}
-.act{text-align:right;white-space:nowrap}
 .err{color:var(--bad)}.okmsg{color:var(--ok)}
-dialog{border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);padding:20px;width:min(560px,94vw)}
+.bar2{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:14px}
+
+/* kamera */
+.camgrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:18px;align-items:start}
+@media (max-width:900px){.camgrid{grid-template-columns:1fr}}
+.stage{position:relative;background:#0f0e0c;border-radius:24px;overflow:hidden;aspect-ratio:16/9;box-shadow:var(--shadow)}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%}
+.stage video{object-fit:contain;transform:scaleX(-1)}
+.stage:fullscreen{border-radius:0;aspect-ratio:auto}
+.idle{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:#e9e4da;padding:20px}
+.idle .logo{margin:0 auto 12px;width:52px;height:52px;border-radius:16px}
+.pill{position:absolute;top:14px;left:14px;max-width:calc(100% - 28px);padding:6px 14px;border-radius:999px;background:rgba(20,18,15,.62);color:#fff;font-size:13px;font-weight:600;backdrop-filter:blur(8px)}
+.pill.err{background:rgba(180,35,24,.85);color:#fff}
+.toast{position:absolute;left:50%;bottom:18px;transform:translate(-50%,12px);opacity:0;transition:.25s;display:flex;gap:10px;align-items:center;padding:8px 18px 8px 8px;border-radius:999px;background:var(--panel);color:var(--ink);box-shadow:var(--shadow);font-weight:600;white-space:nowrap;max-width:94%}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.ctrl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}
+.ctrl select{max-width:240px}
+.feed{display:flex;flex-direction:column;gap:12px}
+.feed .row2{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.tips{margin:14px 0 0;padding:0;list-style:none;color:var(--mute);font-size:13px}
+.tips li+li{margin-top:4px}
+
+/* dialog */
+dialog{border:1px solid var(--line);border-radius:22px;background:var(--panel);color:var(--ink);padding:22px;width:min(560px,94vw);box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
-dialog h2{margin-top:0}
+dialog h2{margin-top:0;font-family:Lora,Georgia,serif;font-weight:500;font-size:22px}
 dialog label:not(.btn){display:block;margin:0 0 10px}
 dialog input:not([type=file]){display:block;width:100%;margin-top:4px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
-.row.end{justify-content:flex-end;margin-top:14px}
-video{width:100%;max-height:260px;background:#000;border-radius:6px}
+.row.end{justify-content:flex-end;margin-top:16px}
+video.pv{width:100%;max-height:260px;background:#000;border-radius:14px}
 .thumbs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
 .th{position:relative}
-.th img{width:64px;height:64px;object-fit:cover;border-radius:6px;display:block}
+.th img{width:64px;height:64px;object-fit:cover;border-radius:10px;display:block}
 .th button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;padding:0;border-radius:50%;border:0;background:var(--bad);color:#fff;cursor:pointer}
 </style>
 </head>
 <body>
-<header><div class="wrap">
-  <div class="brand">Absensi Wajah</div>
-  <nav class="tabs"><a href="#absensi" id="t-abs" class="on">Absensi</a><a href="#kelola" id="t-kelola">Kelola wajah</a></nav>
-  <div class="ctl" id="ctl">
-    <span class="live"><span class="dot" id="dot"></span><span id="status">Menghubungkan...</span></span>
-    <label>Tanggal <input type="date" id="date"></label>
-    <a class="btn" id="export" href="#">Unduh CSV</a>
-  </div>
-</div></header>
-
-<div class="wrap" id="v-abs">
-  <div class="sum">
-    <h1 id="sum">Memuat data...</h1>
-    <p id="sub">&nbsp;</p>
-    <div class="meter" role="img" aria-label="Persentase kehadiran"><i id="meter"></i></div>
-  </div>
-
-  <div class="grid">
-    <section>
-      <div class="head"><h2>Kedatangan terbaru</h2><input type="search" id="q" placeholder="Cari nama" aria-label="Cari nama"></div>
-      <div class="scroll"><table>
-        <thead><tr><th>Jam</th><th>Nama</th></tr></thead>
-        <tbody id="present"></tbody>
-      </table></div>
-    </section>
-    <div class="side">
-      <section><h2>Belum hadir</h2><div id="absent"></div></section>
-      <section><h2>7 hari terakhir</h2><div class="trend" id="trend"></div></section>
+<div class="top">
+  <button class="btn sm" id="menu" type="button" aria-label="Buka menu"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  Absensi Wajah
+</div>
+<div class="scrim" id="scrim"></div>
+<div class="app">
+  <aside class="side" id="side">
+    <div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="9" r="4"/><path d="M4.5 20c1-4 4-6 7.5-6s6.500 2 7.500 6"/></svg></span>Absensi Wajah</div>
+    <nav class="nav">
+      <a href="#ringkasan" id="n-ringkasan"><svg class="ic" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h14V10"/></svg>Ringkasan</a>
+      <a href="#kamera" id="n-kamera"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg>Kamera absen</a>
+      <a href="#kelola" id="n-kelola"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.500"/><path d="M2.500 20c.8-3.600 3.400-5.500 6.500-5.500s5.700 1.900 6.500 5.500M16 5a3.500 3.500 0 010 7M18 14.800c1.900.7 3.200 2.500 3.500 5.200"/></svg>Kelola wajah</a>
+      <a href="#rekap" id="n-rekap"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Rekap kehadiran</a>
+    </nav>
+    <div class="sfoot">
+      <label id="pinbox" hidden>PIN admin <input type="password" id="pin" autocomplete="off"></label>
+      <span class="dot" id="dot"></span><span id="status">Menghubungkan...</span>
     </div>
-  </div>
+  </aside>
 
-  <section>
-    <h2>Rekap kehadiran</h2>
-    <div class="scroll"><table>
-      <thead><tr><th>Nama</th><th>Total hari hadir</th><th>Terakhir hadir</th></tr></thead>
-      <tbody id="recap"></tbody>
-    </table></div>
-  </section>
+  <main class="main">
+    <!-- RINGKASAN -->
+    <section id="v-ringkasan">
+      <div class="hello">
+        <div><h1 id="greet">Selamat datang</h1><p class="sub" id="s-sub">Memuat data...</p></div>
+        <label class="mute">Tanggal <input type="date" id="date"></label>
+      </div>
+      <div class="sugs">
+        <a class="sug" href="#kamera"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg></span><span>Buka kamera absen<small>Pindai wajah langsung di sini</small></span></a>
+        <a class="sug" href="#kelola" id="q-add"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span><span>Tambah orang baru<small>Daftarkan wajah dengan foto atau kamera</small></span></a>
+        <a class="sug" href="#" id="export"><span class="ico"><svg class="ic" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg></span><span>Unduh CSV<small>Absensi pada tanggal terpilih</small></span></a>
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="s-hadir">0</b><span>Sudah hadir</span></div>
+        <div class="stat"><b id="s-belum">0</b><span>Belum hadir</span></div>
+        <div class="stat"><b id="s-total">0</b><span>Wajah terdaftar</span></div>
+        <div class="stat"><b id="s-pct">0%</b><span>Tingkat kehadiran</span><div class="meter" role="img" aria-label="Persentase kehadiran"><i id="meter"></i></div></div>
+      </div>
+      <div class="cols">
+        <div class="card">
+          <div class="head"><h2>Kedatangan terbaru</h2><input type="search" id="q" placeholder="Cari nama" aria-label="Cari nama"></div>
+          <div class="scroll"><table><thead><tr><th>Nama</th><th>Jam</th></tr></thead><tbody id="present"></tbody></table></div>
+        </div>
+        <div>
+          <div class="card"><h2>Belum hadir</h2><div id="absent"></div></div>
+          <div class="card"><h2>7 hari terakhir</h2><div class="trend" id="trend"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- KAMERA ABSEN -->
+    <section id="v-kamera" hidden>
+      <div class="hello">
+        <div><h1>Kamera absen</h1><p class="sub">Berdiri di depan kamera. Wajah dikenali otomatis dan kehadiran langsung tercatat.</p></div>
+      </div>
+      <div class="camgrid">
+        <div>
+          <div class="stage" id="stage">
+            <video id="c-video" playsinline muted></video>
+            <canvas id="c-canvas"></canvas>
+            <div class="idle" id="c-idle"><div><span class="logo"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.500"/></svg></span>Kamera belum aktif<br><span class="mute">Tekan Mulai kamera untuk memulai absen otomatis</span></div></div>
+            <div class="pill" id="c-pill" hidden></div>
+            <div class="toast" id="c-toast"></div>
+          </div>
+          <div class="ctrl">
+            <button class="btn pri" id="c-toggle" type="button">Mulai kamera</button>
+            <select id="c-dev" aria-label="Pilih kamera" hidden></select>
+            <button class="btn" id="c-full" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>Layar penuh</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Baru saja hadir</h2>
+          <p class="mute" id="c-count" style="margin:-6px 0 12px"></p>
+          <div class="feed" id="c-feed"></div>
+          <ul class="tips">
+            <li>Jarak ideal 0,5 sampai 2 meter dari kamera.</li>
+            <li>Pastikan cahaya cukup dan wajah menghadap lurus.</li>
+            <li>Kotak ungu berarti sedang memverifikasi, hijau berarti dikenali.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- KELOLA WAJAH -->
+    <section id="v-kelola" hidden>
+      <div class="hello">
+        <div><h1>Kelola wajah</h1><p class="sub">Tambah, ubah, atau hapus wajah terdaftar. Foto tidak disimpan, hanya data pengenal wajah (embedding).</p></div>
+        <button class="btn pri" id="k-add" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Tambah orang</button>
+      </div>
+      <p id="k-msg" role="status"></p>
+      <div class="card"><div class="scroll"><table>
+        <thead><tr><th>Nama</th><th>ID</th><th>Sampel</th><th></th></tr></thead>
+        <tbody id="k-rows"></tbody>
+      </table></div></div>
+    </section>
+
+    <!-- REKAP -->
+    <section id="v-rekap" hidden>
+      <div class="hello">
+        <div><h1>Rekap kehadiran</h1><p class="sub">Total hari hadir setiap orang berdasarkan absensi.csv.</p></div>
+        <input type="search" id="r-q" placeholder="Cari nama" aria-label="Cari nama">
+      </div>
+      <div class="card"><div class="scroll" style="max-height:none"><table>
+        <thead><tr><th>Nama</th><th>Total catatan</th><th>Terakhir hadir</th></tr></thead>
+        <tbody id="recap"></tbody>
+      </table></div></div>
+    </section>
+  </main>
 </div>
-<div class="wrap" id="v-kelola" hidden>
-  <div class="sum">
-    <h1>Kelola wajah</h1>
-    <p>Tambah, ubah, atau hapus wajah terdaftar. Foto tidak disimpan, hanya data pengenal wajah (embedding). Mode absen memuat perubahan otomatis dalam beberapa detik.</p>
-  </div>
-  <div class="bar2">
-    <button class="btn pri" id="k-add" type="button">Tambah orang</button>
-    <label id="k-pinbox" hidden>PIN admin <input type="password" id="k-pin" autocomplete="off"></label>
-    <span id="k-msg" role="status"></span>
-  </div>
-  <div class="scroll"><table>
-    <thead><tr><th>Nama</th><th>ID</th><th>Sampel</th><th></th></tr></thead>
-    <tbody id="k-rows"></tbody>
-  </table></div>
-</div>
+
 <dialog id="dlg" aria-labelledby="dlg-title">
   <h2 id="dlg-title">Tambah orang</h2>
   <label>Nama <input id="d-nama" maxlength="60" autocomplete="off"></label>
@@ -424,7 +621,7 @@ video{width:100%;max-height:260px;background:#000;border-radius:6px}
       <button class="btn" id="d-cam" type="button">Pakai kamera browser</button>
     </div>
     <div id="d-camwrap" hidden>
-      <video id="d-video" playsinline muted></video>
+      <video class="pv" id="d-video" playsinline muted></video>
       <p id="d-prompt" class="mute">&nbsp;</p>
       <div class="row">
         <button class="btn" id="d-auto" type="button">Ambil 8 foto otomatis</button>
@@ -440,21 +637,45 @@ video{width:100%;max-height:260px;background:#000;border-radius:6px}
     <button class="btn pri" id="d-save" type="button">Simpan</button>
   </div>
 </dialog>
-<footer><div class="wrap mute">Data dibaca langsung dari absensi.csv dan diperbarui otomatis tiap 4 detik.</div></footer>
 
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const today = () => new Date().toLocaleDateString('sv-SE');
+const ini = n => (String(n).trim()[0] || '?').toUpperCase();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const VIEWS = ['ringkasan', 'kamera', 'kelola', 'rekap'];
 const dateEl = $('date');
 dateEl.value = today();
-let data = null;
+let view = 'ringkasan', data = null, info = null, pendingAdd = false;
 
+const pinHeader = () => { const p = sessionStorage.getItem('pin'); return p ? {'X-Pin': p} : {}; };
+$('pin').value = sessionStorage.getItem('pin') || '';
+$('pin').addEventListener('input', e => sessionStorage.setItem('pin', e.target.value));
+
+// ---------- navigasi ----------
+function closeNav() { $('side').classList.remove('open'); $('scrim').classList.remove('open'); }
+$('menu').onclick = () => { $('side').classList.add('open'); $('scrim').classList.add('open'); };
+$('scrim').onclick = closeNav;
+
+function route() {
+  const h = location.hash.slice(1);
+  const next = VIEWS.includes(h) ? h : 'ringkasan';
+  if (view === 'kamera' && next !== 'kamera') camStop();
+  view = next;
+  VIEWS.forEach(v => { $('v-' + v).hidden = v !== view; $('n-' + v).classList.toggle('on', v === view); });
+  closeNav();
+  if (view === 'kelola' || view === 'kamera') loadPeople();
+  load();
+}
+
+// ---------- data absensi ----------
 async function load() {
   if (!dateEl.value) dateEl.value = today();
+  const date = view === 'kamera' ? today() : dateEl.value;
   $('export').href = '/export?date=' + dateEl.value;
   try {
-    const r = await fetch('/api/data?date=' + dateEl.value, {cache: 'no-store'});
+    const r = await fetch('/api/data?date=' + date, {cache: 'no-store'});
     if (!r.ok) throw new Error(r.status);
     data = await r.json();
     draw();
@@ -466,12 +687,24 @@ async function load() {
   }
 }
 
+function greeting() {
+  const h = new Date().getHours();
+  return h < 11 ? 'Selamat pagi' : h < 15 ? 'Selamat siang' : h < 18 ? 'Selamat sore' : 'Selamat malam';
+}
+
 function draw() {
+  drawSummary(); drawRecap(); drawFeed();
+}
+
+function drawSummary() {
   const n = data.present.length, t = data.registered;
-  $('sum').textContent = t ? `${n} dari ${t} orang sudah hadir` : `${n} orang sudah hadir`;
-  $('sub').textContent = t
-    ? `${data.pct}% hadir, ${data.absent.length} belum hadir`
-    : 'Belum ada wajah terdaftar. Jalankan: python absen_wajah.py enroll "Nama"';
+  const label = new Date(dateEl.value + 'T00:00').toLocaleDateString('id-ID', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
+  $('greet').textContent = greeting() + ', Admin';
+  $('s-sub').textContent = t ? `${label}. ${n} dari ${t} orang sudah hadir.` : `${label}. Belum ada wajah terdaftar, tambahkan lewat Kelola wajah.`;
+  $('s-hadir').textContent = n;
+  $('s-belum').textContent = t ? data.absent.length : '-';
+  $('s-total').textContent = t;
+  $('s-pct').textContent = data.pct + '%';
   $('meter').style.width = data.pct + '%';
   drawPresent();
   $('absent').innerHTML = !t ? '<p class="mute">Daftar belum tersedia.</p>'
@@ -481,45 +714,161 @@ function draw() {
   $('trend').innerHTML = data.trend.map((x, i) =>
     `<div class="bar${i === data.trend.length - 1 ? ' sel' : ''}"><div>${x.count}</div>` +
     `<div class="fill"><i style="height:${x.count / max * 100}%"></i></div><div>${x.date.slice(5)}</div></div>`).join('');
-  $('recap').innerHTML = data.recap.map(r =>
-    `<tr><td>${esc(r.nama)}</td><td class="num">${r.total}</td><td class="num">${esc(r.last)}</td></tr>`).join('')
-    || '<tr><td colspan="3" class="mute">Belum ada data absensi.</td></tr>';
 }
 
 function drawPresent() {
   const q = $('q').value.trim().toLowerCase();
   const rows = data.present.filter(p => p.nama.toLowerCase().includes(q));
   $('present').innerHTML = rows.map(p =>
-    `<tr><td class="num">${esc(p.jam)}</td><td>${esc(p.nama)}</td></tr>`).join('')
+    `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td class="num">${esc(p.jam)}</td></tr>`).join('')
     || `<tr><td colspan="2" class="mute">${q ? 'Nama tidak ditemukan.' : 'Belum ada yang hadir pada tanggal ini.'}</td></tr>`;
+}
+
+function drawRecap() {
+  const q = $('r-q').value.trim().toLowerCase();
+  const rows = data.recap.filter(r => r.nama.toLowerCase().includes(q));
+  $('recap').innerHTML = rows.map(r =>
+    `<tr><td><div class="who"><span class="av">${esc(ini(r.nama))}</span>${esc(r.nama)}</div></td><td class="num">${r.total}</td><td class="num">${esc(r.last)}</td></tr>`).join('')
+    || '<tr><td colspan="3" class="mute">Belum ada data absensi.</td></tr>';
+}
+
+function drawFeed() {
+  const n = data.present.length, t = data.registered;
+  $('c-count').textContent = t ? `${n} dari ${t} orang hadir hari ini` : `${n} orang hadir hari ini`;
+  $('c-feed').innerHTML = data.present.slice(0, 8).map(p =>
+    `<div class="row2"><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div><span class="mute num">${esc(p.jam)}</span></div>`).join('')
+    || '<p class="mute">Belum ada yang hadir.</p>';
 }
 
 dateEl.addEventListener('change', load);
 $('q').addEventListener('input', () => data && drawPresent());
-setInterval(() => { if (!document.hidden && view === 'abs') load(); }, 4000);
-load();
+$('r-q').addEventListener('input', () => data && drawRecap());
+setInterval(() => { if (!document.hidden && view !== 'kelola') load(); }, 4000);
 
-// ---------- Kelola wajah ----------
-let view = 'abs', info = null, mode = null, target = null, imgs = [], stream = null, busy = false;
+// ---------- kamera absen ----------
+const cam = {stream: null, on: false, tok: 0};
+const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#7c3aed', unknown: '#dc2626', far: '#78716c'};
+const grab = document.createElement('canvas');
+let toastTimer = null, reloadTimer = null;
+
+function setPill(text, err) {
+  const p = $('c-pill');
+  p.hidden = !text; p.textContent = text || ''; p.className = 'pill' + (err ? ' err' : '');
+}
+
+async function listDevices() {
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    const cur = cam.stream && cam.stream.getVideoTracks()[0].getSettings().deviceId;
+    $('c-dev').innerHTML = devs.map((d, i) => `<option value="${esc(d.deviceId)}"${d.deviceId === cur ? ' selected' : ''}>${esc(d.label || 'Kamera ' + (i + 1))}</option>`).join('');
+    $('c-dev').hidden = devs.length < 2;
+  } catch (e) { /* abaikan */ }
+}
+
+async function camStart() {
+  if (!info || !info.editable) { setPill('Kamera absen nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
+  if (!navigator.mediaDevices) { setPill('Kamera browser hanya tersedia di localhost atau HTTPS.', true); return; }
+  camStop(true);
+  try {
+    const dev = $('c-dev').value;
+    cam.stream = await navigator.mediaDevices.getUserMedia({video: dev && !$('c-dev').hidden ? {deviceId: {exact: dev}} : {width: {ideal: 1280}, height: {ideal: 720}}});
+    const v = $('c-video'); v.srcObject = cam.stream; await v.play();
+  } catch (e) { setPill('Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai aplikasi lain).', true); return; }
+  cam.on = true; const tok = ++cam.tok;
+  $('c-idle').hidden = true; $('c-toggle').textContent = 'Hentikan kamera';
+  setPill('Menunggu wajah...');
+  await listDevices();
+  scanLoop(tok);
+}
+
+function camStop(keepUi) {
+  cam.on = false; cam.tok++;
+  if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
+  cam.stream = null; $('c-video').srcObject = null;
+  const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
+  if (!keepUi) { $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera'; }
+}
+
+async function scanLoop(tok) {
+  while (cam.on && cam.tok === tok) {
+    const v = $('c-video');
+    if (v.videoWidth) {
+      const w = Math.min(800, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth);
+      grab.width = w; grab.height = h;
+      grab.getContext('2d').drawImage(v, 0, 0, w, h);
+      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.75));
+      try {
+        const r = await fetch('/api/scan', {method: 'POST', headers: {'Content-Type': 'image/jpeg', ...pinHeader()}, body: blob});
+        const j = await r.json().catch(() => ({message: 'Respons server tidak valid'}));
+        if (!r.ok) throw new Error(j.message || r.status);
+        if (!cam.on || cam.tok !== tok) return;
+        drawFaces(j.faces);
+        j.events.forEach(showToast);
+        if (j.events.length) { clearTimeout(reloadTimer); reloadTimer = setTimeout(load, 300); }
+        setPill(j.db_empty ? 'Database wajah kosong. Tambahkan orang di Kelola wajah.'
+          : j.faces.length ? `${j.faces.length} wajah terdeteksi` : 'Menunggu wajah...', j.db_empty);
+      } catch (e) {
+        if (cam.tok !== tok) return;
+        setPill(e.message, true);
+        await sleep(1500);
+      }
+    }
+    await sleep(120);
+  }
+}
+
+function layout() {
+  const c = $('c-canvas'), v = $('c-video'), dpr = window.devicePixelRatio || 1;
+  const cw = c.clientWidth, ch = c.clientHeight;
+  if (c.width !== Math.round(cw * dpr) || c.height !== Math.round(ch * dpr)) { c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr); }
+  const vw = v.videoWidth || 16, vh = v.videoHeight || 9, s = Math.min(cw / vw, ch / vh);
+  const dw = vw * s, dh = vh * s;
+  return {dpr, cw, ch, ox: (cw - dw) / 2, oy: (ch - dh) / 2, dw, dh};
+}
+
+function drawFaces(list) {
+  const L = layout(), g = $('c-canvas').getContext('2d');
+  g.setTransform(L.dpr, 0, 0, L.dpr, 0, 0); g.clearRect(0, 0, L.cw, L.ch);
+  g.font = '600 13px "Plus Jakarta Sans",system-ui,sans-serif'; g.textBaseline = 'middle';
+  for (const f of list) {
+    const [bx, by, bw, bh] = f.box;
+    const x = L.ox + (1 - bx - bw) * L.dw, y = L.oy + by * L.dh, w = bw * L.dw, h = bh * L.dh;   // video dicerminkan
+    const col = COL[f.status] || COL.unknown;
+    const text = f.status === 'tercatat' ? `✓ ${f.nama} · Tercatat`
+      : f.status === 'hadir' ? `${f.nama} · Sudah hadir`
+      : f.status === 'cek' ? `${f.nama}?`
+      : f.status === 'far' ? 'Terlalu jauh' : 'Tidak dikenal';
+    g.strokeStyle = col; g.lineWidth = 2.5; g.beginPath();
+    if (g.roundRect) g.roundRect(x, y, w, h, 14); else g.rect(x, y, w, h);
+    g.stroke();
+    const tw = g.measureText(text).width + 18, ly = Math.max(y - 28, 2);
+    g.fillStyle = col; g.beginPath();
+    if (g.roundRect) g.roundRect(x, ly, tw, 24, 12); else g.rect(x, ly, tw, 24);
+    g.fill();
+    g.fillStyle = '#fff'; g.fillText(text, x + 9, ly + 12.5);
+  }
+}
+
+function showToast(e) {
+  const t = $('c-toast');
+  t.innerHTML = `<span class="av">${esc(ini(e.nama))}</span>Tercatat: ${esc(e.nama)} · ${esc(e.jam)}`;
+  t.classList.add('show'); clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+$('c-toggle').onclick = () => cam.on ? camStop() : camStart();
+$('c-dev').onchange = () => cam.on && camStart();
+$('c-full').onclick = () => { const s = $('stage'); document.fullscreenElement ? document.exitFullscreen() : s.requestFullscreen && s.requestFullscreen(); };
+
+// ---------- kelola wajah ----------
+let mode = null, target = null, imgs = [], stream = null, busy = false;
 const PROMPTS = ['Hadap lurus', 'Tengok sedikit ke kiri', 'Tengok sedikit ke kanan', 'Dongak sedikit',
                  'Tunduk sedikit', 'Hadap lurus, rileks', 'Senyum tipis', 'Hadap lurus'];
-
-function route() {
-  view = location.hash === '#kelola' ? 'kelola' : 'abs';
-  $('v-abs').hidden = view !== 'abs';
-  $('v-kelola').hidden = view !== 'kelola';
-  $('ctl').hidden = view !== 'abs';
-  $('t-abs').classList.toggle('on', view === 'abs');
-  $('t-kelola').classList.toggle('on', view === 'kelola');
-  if (view === 'kelola') loadPeople(); else load();
-}
 
 function say(t, err) { const m = $('k-msg'); m.textContent = t; m.className = err ? 'err' : 'okmsg'; }
 
 async function api(method, path, body) {
-  const h = {'Content-Type': 'application/json'};
-  if ($('k-pin').value) h['X-Pin'] = $('k-pin').value;
-  const r = await fetch(path, {method, headers: h, body: JSON.stringify(body)});
+  const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', ...pinHeader()}, body: JSON.stringify(body)});
   const j = await r.json().catch(() => ({message: 'Respons server tidak valid'}));
   if (!r.ok) { const e = new Error(j.message || r.status); e.rejected = j.rejected || []; throw e; }
   return j;
@@ -529,15 +878,16 @@ async function loadPeople() {
   try {
     info = await (await fetch('/api/people', {cache: 'no-store'})).json();
   } catch (e) { say('Server tidak terjangkau', true); return; }
-  $('k-pinbox').hidden = !info.pin_required;
+  $('pinbox').hidden = !info.pin_required;
   $('k-add').disabled = !info.editable;
   $('k-rows').innerHTML = info.people.map((p, i) =>
-    `<tr><td>${esc(p.nama)}</td><td>${esc(p.id) || '<span class="mute">-</span>'}</td><td class="num">${p.sampel}</td>` +
+    `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td>${esc(p.id) || '<span class="mute">-</span>'}</td><td class="num">${p.sampel}</td>` +
     `<td class="act"><button class="btn sm" data-a="samples" data-i="${i}">Tambah sampel</button> ` +
     `<button class="btn sm" data-a="edit" data-i="${i}">Ubah</button> ` +
     `<button class="btn sm bad" data-a="del" data-i="${i}">Hapus</button></td></tr>`).join('')
     || '<tr><td colspan="4" class="mute">Belum ada wajah terdaftar.</td></tr>';
   if (!info.editable) say('Pengelolaan nonaktif: jalankan dashboard dengan --pin untuk mengaktifkannya dari jaringan.', true);
+  if (pendingAdd) { pendingAdd = false; if (info.editable && view === 'kelola') openDlg('add'); }
 }
 
 function renderThumbs() {
@@ -581,7 +931,7 @@ async function startCam() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 1280}, height: {ideal: 720}}});
     $('d-video').srcObject = stream; await $('d-video').play(); $('d-camwrap').hidden = false;
-  } catch (e) { $('d-err').textContent = 'Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai mode absen). Gunakan unggah foto.'; }
+  } catch (e) { $('d-err').textContent = 'Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai). Gunakan unggah foto.'; }
 }
 
 function stopCam() { if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; }
@@ -598,7 +948,7 @@ async function autoSnap() {
   busy = true; $('d-auto').disabled = true;
   for (let i = 0; i < 8 && imgs.length < info.max_images && stream; i++) {
     $('d-prompt').textContent = PROMPTS[i];
-    await new Promise(r => setTimeout(r, 900)); snap();
+    await sleep(900); snap();
   }
   $('d-prompt').textContent = 'Selesai. Periksa foto, lalu Simpan.';
   busy = false; $('d-auto').disabled = false;
@@ -629,6 +979,7 @@ async function del(p) {
 }
 
 window.addEventListener('hashchange', route);
+$('q-add').onclick = e => { e.preventDefault(); pendingAdd = true; if (view === 'kelola') loadPeople(); else location.hash = '#kelola'; };
 $('k-add').onclick = () => openDlg('add');
 $('k-rows').onclick = e => {
   const b = e.target.closest('button[data-a]'); if (!b) return;
@@ -640,6 +991,7 @@ $('d-cam').onclick = startCam; $('d-snap').onclick = snap; $('d-auto').onclick =
 $('d-thumbs').onclick = e => { const b = e.target.closest('button[data-rm]'); if (b) { imgs.splice(+b.dataset.rm, 1); renderThumbs(); } };
 $('d-save').onclick = save; $('d-cancel').onclick = () => $('dlg').close();
 $('dlg').addEventListener('close', stopCam);
+fetch('/api/people', {cache: 'no-store'}).then(r => r.json()).then(j => { info = j; $('pinbox').hidden = !j.pin_required; }).catch(() => {});
 route();
 </script>
 </body>
@@ -686,28 +1038,33 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
 
+    def guard(self, ctype, limit):
+        """Cek keamanan (aktif, origin, host, content-type, PIN, ukuran) lalu kembalikan isi body."""
+        host, origin = self.headers.get("Host", ""), self.headers.get("Origin")
+        if not EDIT_ENABLED:
+            raise ApiError(403, "Fitur ini nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.")
+        if origin and urlparse(origin).netloc != host:
+            raise ApiError(403, "Permintaan lintas situs ditolak.")
+        if not PIN and host.rsplit(":", 1)[0].strip("[]") not in ("127.0.0.1", "localhost", "::1"):
+            raise ApiError(403, "Host tidak diizinkan.")
+        if not self.headers.get("Content-Type", "").startswith(ctype):
+            raise ApiError(415, f"Content-Type harus {ctype}.")
+        if not hmac.compare_digest(self.headers.get("X-Pin", "").encode(), PIN.encode()):
+            raise ApiError(403, "PIN salah atau belum diisi.")
+        n = int(self.headers.get("Content-Length") or 0)
+        if not 0 < n <= limit:
+            raise ApiError(413, "Ukuran data tidak valid atau terlalu besar.")
+        return self.rfile.read(n)
+
     def route(self, method):
         """Aksi CRUD: cek keamanan -> baca JSON -> jalankan di bawah kunci -> kirim hasil."""
         action = ROUTES.get((method, urlparse(self.path).path))
         if action is None:
             return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
         try:
-            host, origin = self.headers.get("Host", ""), self.headers.get("Origin")
-            if not EDIT_ENABLED:
-                raise ApiError(403, "Pengelolaan wajah nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.")
-            if origin and urlparse(origin).netloc != host:
-                raise ApiError(403, "Permintaan lintas situs ditolak.")
-            if not PIN and host.rsplit(":", 1)[0].strip("[]") not in ("127.0.0.1", "localhost", "::1"):
-                raise ApiError(403, "Host tidak diizinkan.")
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
-                raise ApiError(415, "Content-Type harus application/json.")
-            if not hmac.compare_digest(self.headers.get("X-Pin", "").encode(), PIN.encode()):
-                raise ApiError(403, "PIN salah atau belum diisi.")
-            n = int(self.headers.get("Content-Length") or 0)
-            if not 0 < n <= MAX_BODY:
-                raise ApiError(413, "Ukuran data tidak valid atau terlalu besar.")
+            raw = self.guard("application/json", MAX_BODY)
             try:
-                data = json.loads(self.rfile.read(n))
+                data = json.loads(raw)
             except ValueError:
                 raise ApiError(400, "JSON tidak valid.")
             if not isinstance(data, dict):
@@ -721,7 +1078,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # model/file bermasalah
             self.send(500, json.dumps({"ok": False, "message": f"Gagal: {e}"}), JSON)
 
+    def scan(self):
+        """Terima satu frame JPEG dari kamera browser, kembalikan wajah terdeteksi dan absen baru."""
+        try:
+            out = api_scan(self.guard("image/jpeg", MAX_FRAME))
+            self.send(200, json.dumps({"ok": True, **out}), JSON)
+        except ApiError as e:
+            self.send(e.code, json.dumps({"ok": False, "message": e.msg}), JSON)
+        except Exception as e:
+            self.send(500, json.dumps({"ok": False, "message": f"Gagal memindai: {e}"}), JSON)
+
     def do_POST(self):
+        if urlparse(self.path).path == "/api/scan":
+            return self.scan()
         self.route("POST")
 
     def do_PUT(self):
@@ -733,16 +1102,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global PIN, EDIT_ENABLED
-    ap = argparse.ArgumentParser(description="Dashboard Absensi Wajah")
+    ap = argparse.ArgumentParser(description="Dashboard Admin Absensi Wajah")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("--pin", default="", help="PIN admin untuk mengelola wajah (wajib jika --host bukan localhost)")
+    ap.add_argument("--pin", default="", help="PIN admin untuk kamera absen dan pengelolaan wajah (wajib jika --host bukan localhost)")
     a = ap.parse_args()
     PIN = a.pin
     EDIT_ENABLED = a.host in ("127.0.0.1", "localhost", "::1") or bool(PIN)
     if not EDIT_ENABLED:
-        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi pengelolaan wajah dinonaktifkan (hanya baca).")
+        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah dinonaktifkan (hanya baca).")
 
     server = ThreadingHTTPServer((a.host, a.port), Handler)
     url = f"http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}"
