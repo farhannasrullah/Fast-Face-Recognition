@@ -1,5 +1,5 @@
 """
-Dashboard Admin Absensi Wajah - gaya UI selaras dengan chat RAG (netral hangat, aksen ungu).
+Dashboard Admin Absensi Wajah (versi optimal) - gaya UI selaras dengan chat RAG (netral hangat, aksen ungu).
 
 Halaman  : Ringkasan | Kamera absen (built-in di browser) | Kelola wajah (CRUD) | Rekap
 Tema     : Otomatis (ikut sistem) / Terang / Gelap, pilihan tersimpan di browser.
@@ -10,11 +10,17 @@ Buka     : http://127.0.0.1:8000  (otomatis terbuka di browser)
 Opsi     : --port 8000
            --host 0.0.0.0   (agar bisa dibuka dari HP/PC lain di jaringan yang sama)
            --no-browser     (jangan buka browser otomatis)
-           --pin 1234       (wajib jika dibuka dari jaringan agar kamera absen dan pengelolaan wajah aktif)
+           --pin 1234       (wajib jika dibuka dari jaringan; melindungi kamera absen, pengelolaan
+                             wajah, DAN pembacaan data absensi)
 
 Kamera absen memakai kamera browser. Browser hanya mengizinkan kamera di localhost atau HTTPS,
 jadi untuk perangkat lain di jaringan gunakan HTTPS (mis. reverse proxy) atau buka dari komputer ini.
-Boleh berjalan bersamaan dengan 'main.py run': perubahan wajah dimuat ulang otomatis.
+PIN dikirim apa adanya lewat HTTP biasa; di jaringan yang tidak tepercaya pakai HTTPS.
+Boleh berjalan bersamaan dengan 'main.py run': log absen selalu disinkronkan, jadi tidak ada absen ganda.
+
+Perubahan utama: kamera web memakai pelacak wajah + throttle embedding (seperti main.py), frame 1280px
+agar jangkauan sama dengan main.py, satu logger bersama (tanpa parse ulang CSV), cache hasil statistik,
+dan endpoint baca ikut dilindungi PIN.
 """
 import argparse
 import base64
@@ -23,6 +29,7 @@ import hmac
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -35,20 +42,26 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "absensi.csv")
 DB_FILE = os.path.join(BASE, "faces_db.npz")
 _cache = {}
+_build_cache = {}
+
+
+def _sig(path):
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
 
 
 def cached(path, loader):
     """Baca ulang file hanya jika isinya berubah (hemat CPU dan RAM)."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return loader(None)
-    key = (st.st_mtime_ns, st.st_size)
+    key = _sig(path)
     hit = _cache.get((path, loader.__name__))
-    if not hit or hit[0] != key:
-        hit = (key, loader(path))
-        _cache[(path, loader.__name__)] = hit
-    return hit[1]
+    if hit and hit[0] == key:
+        return hit[1]
+    val = loader(path if key else None)
+    _cache[(path, loader.__name__)] = (key, val)
+    return val
 
 
 def read_rows(path):
@@ -72,7 +85,7 @@ def read_names(path):
         return []
 
 
-def build(date):
+def _build(date):
     rows = cached(LOG_FILE, read_rows)
     registered = cached(DB_FILE, read_names)
     present = sorted(((j, n) for d, j, n in rows if d == date), reverse=True)
@@ -80,15 +93,15 @@ def build(date):
 
     end = datetime.strptime(date, "%Y-%m-%d")
     days = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
-    per_day = {}
-    recap = {}
+    per_day, days_by_name, recap = {}, {}, {}
     for d, j, n in rows:
         per_day.setdefault(d, set()).add(n)
+        days_by_name.setdefault(n, set()).add(d)
         r = recap.setdefault(n, {"nama": n, "total": 0, "days": 0, "last": ""})
         r["total"] += 1
         r["last"] = max(r["last"], f"{d} {j}")
-    for r in recap.values():           # jumlah hari berbeda tempat orang ini tercatat hadir
-        r["days"] = sum(1 for s in per_day.values() if r["nama"] in s)
+    for n, r in recap.items():          # jumlah hari berbeda tempat orang ini tercatat hadir
+        r["days"] = len(days_by_name[n])
 
     total = len(registered)
     return {
@@ -100,8 +113,18 @@ def build(date):
         "trend": [{"date": d, "count": len(per_day.get(d, ()))} for d in days],
         "work_days": len(per_day),
         "recap": sorted(recap.values(), key=lambda r: (-r["total"], r["nama"])),
-        "updated": datetime.now().strftime("%H:%M:%S"),
     }
+
+
+def build(date):
+    """Statistik per tanggal; hasil di-memo selama CSV dan database tidak berubah."""
+    key = (_sig(LOG_FILE), _sig(DB_FILE))
+    hit = _build_cache.get(date)
+    if not hit or hit[0] != key:
+        if len(_build_cache) > 16:
+            _build_cache.clear()
+        hit = _build_cache[date] = (key, _build(date))
+    return {**hit[1], "updated": datetime.now().strftime("%H:%M:%S")}
 
 
 # ----------------------------- Kelola wajah (CRUD) + kamera absen -----------------------------
@@ -115,11 +138,12 @@ EDIT_ENABLED = True        # False jika dashboard terbuka di jaringan tanpa --pi
 EDIT_LOCK = threading.Lock()
 ENGINE_LOCK = threading.Lock()   # model OpenCV tidak aman dipakai bersamaan
 SCAN_LOCK = threading.Lock()
-SCAN_MIN_FACE_PX = 56      # lebar wajah minimum (px, pada frame kiriman browser)
-SCAN_STREAK_GAP = 2.5      # detik maksimum antar kecocokan beruntun
-RECHECK_LOG = 5.0          # jeda cek ulang catatan absen untuk orang yang sama
+INIT_LOCK = threading.RLock()
+SCAN_DETECT_W = 640        # lebar frame untuk deteksi (embedding tetap dari frame penuh)
+SCAN_MIN_FACE_PX = 48      # lebar wajah minimum (px, pada frame kiriman browser, maks 1280)
+SCAN_SESSION_TTL = 30.0    # detik: sesi kamera tanpa frame baru dibuang
 _core = {}
-_streak, _checked = {}, {}
+_sessions = {}
 
 
 class ApiError(Exception):
@@ -130,20 +154,30 @@ class ApiError(Exception):
 
 def get_main():
     """Muat main.py (OpenCV) sekali saja, hanya saat pertama kali dibutuhkan."""
-    if "main" not in _core:
-        os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(40_000_000))  # tolak gambar raksasa
-        sys.path.insert(0, BASE)
-        import main
-        main.cv2.setNumThreads(main.CV_THREADS)
-        _core["main"] = main
-    return _core["main"]
+    with INIT_LOCK:
+        if "main" not in _core:
+            os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(40_000_000))  # tolak gambar raksasa
+            sys.path.insert(0, BASE)
+            import main
+            main.cv2.setNumThreads(main.CV_THREADS)
+            _core["main"] = main
+        return _core["main"]
 
 
 def get_engine():
     main = get_main()
-    if "engine" not in _core:
-        _core["engine"] = main.FaceEngine(*main.ensure_models())
-    return _core["engine"]
+    with INIT_LOCK:
+        if "engine" not in _core:
+            _core["engine"] = main.FaceEngine(*main.ensure_models())
+        return _core["engine"]
+
+
+def get_logger(main):
+    """Satu logger bersama; membaca CSV hanya bila ada baris baru."""
+    with INIT_LOCK:
+        if "logger" not in _core:
+            _core["logger"] = main.AttendanceLogger()
+        return _core["logger"]
 
 
 def read_people(path):
@@ -237,7 +271,7 @@ def similar_warning(db, good, name):
     np = get_main().np
     mean = np.mean(good, axis=0)
     mean /= np.linalg.norm(mean)
-    other, _, sc = db.match(mean)
+    other, _, sc, _ = db.best(mean)
     if other and other.casefold() != name.casefold() and sc >= 0.5:
         return f"Wajah ini sangat mirip dengan '{other}' (skor {sc:.2f}). Pastikan tidak terdaftar ganda."
     return ""
@@ -305,72 +339,77 @@ def scan_db(main):
         db = _core["db"] = main.Database(DB_FILE)
     elif db.changed():
         db.reload()
+        for s in _sessions.values():          # verifikasi ulang wajah yang sedang terlihat
+            for t in s["tracker"].tracks.values():
+                t.next_embed = 0.0
     return db
 
 
-def log_once(main, name, pid, score, now, events):
-    """Catat absen sesuai aturan cooldown main.py. Kembalikan 'tercatat' atau 'hadir'."""
-    chk = _checked.get(name)
-    if chk and now - chk[0] < RECHECK_LOG:
-        return chk[1]
-    lg = main.AttendanceLogger()        # baca ulang CSV agar sinkron dengan 'main.py run'
-    dt = datetime.now()
-    if lg.should_log(name, dt):
-        lg.log(name, pid, score, dt)
-        events.append({"nama": name, "id": pid, "jam": dt.strftime("%H:%M:%S")})
-        print(f"[ABSEN] {dt:%Y-%m-%d %H:%M:%S}  {name}  (skor {score:.2f}, kamera web)")
-        status = "tercatat"
-    else:
-        status = "hadir"
-    _checked[name] = (now, status)
-    return status
+def get_session(main, cam, now):
+    """Satu pelacak per sesi kamera browser; sesi yang lama tidak aktif dibuang."""
+    for k in [k for k, v in _sessions.items() if now - v["ts"] > SCAN_SESSION_TTL]:
+        del _sessions[k]
+    s = _sessions.get(cam)
+    if s is None:
+        s = _sessions[cam] = {"tracker": main.Tracker(), "ts": now}
+    s["ts"] = now
+    return s
 
 
-def api_scan(raw):
+def api_scan(raw, cam):
     main, engine = get_main(), get_engine()
     np, cv2 = main.np, main.cv2
     img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise ApiError(400, "Frame bukan gambar yang valid.")
     h, w = img.shape[:2]
-    sw = min(w, 640)
+    sw = min(w, SCAN_DETECT_W)
     sh = max(1, round(h * sw / w))
     small = img if sw == w else cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
     scale = (w / sw, h / sh)
     faces_out, events = [], []
+    now = time.time()
     with SCAN_LOCK:
-        db = scan_db(main)
-        found = []
+        db, logger = scan_db(main), get_logger(main)
+        tracker = get_session(main, cam, now)["tracker"]
+        recheck = main._recheck_delay()
         with ENGINE_LOCK:
-            for row in engine.detect(small):
-                big = row[2] * scale[0] >= SCAN_MIN_FACE_PX
-                found.append((row, engine.embed(img, row, scale) if big else None))
-        now = time.time()
-        for k in [k for k, v in _streak.items() if now - v[1] > SCAN_STREAK_GAP]:
-            del _streak[k]
-        for row, emb in found:
-            box = [float(row[0] / sw), float(row[1] / sh), float(row[2] / sw), float(row[3] / sh)]
-            if emb is None:
-                faces_out.append({"box": box, "status": "far"})
-                continue
-            name, pid, score = db.match(emb)
-            if name is None or score < main.MATCH_THRESH:
-                faces_out.append({"box": box, "status": "unknown", "skor": round(score, 2)})
-                continue
-            st = _streak.get(name)
-            n = st[0] + 1 if st else 1
-            _streak[name] = (n, now)
-            if n < main.CONFIRM_MATCHES:
-                faces_out.append({"box": box, "status": "cek", "nama": name, "skor": round(score, 2)})
-                continue
-            status = log_once(main, name, pid, score, now, events)
-            faces_out.append({"box": box, "status": status, "nama": name, "skor": round(score, 2)})
+            rows = engine.detect(small)
+            near = [f for f in rows if f[2] * scale[0] >= SCAN_MIN_FACE_PX]
+            far = [f for f in rows if SCAN_MIN_FACE_PX * 0.5 <= f[2] * scale[0] < SCAN_MIN_FACE_PX]
+            fresh = tracker.update(near)
+            for t in fresh:
+                if now >= t.next_embed:       # embedding hanya bila perlu (sama seperti main.py)
+                    dt = main.apply_match(t, *db.match(engine.embed(img, t.row, scale)),
+                                          now, logger, recheck)
+                    if dt:
+                        t.flash = now + 2.0
+                        events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S")})
+        for f in far:
+            faces_out.append({"box": [float(f[0] / sw), float(f[1] / sh), float(f[2] / sw), float(f[3] / sh)],
+                              "status": "far"})
+        for t in fresh:
+            if t.name:
+                status = "tercatat" if now < getattr(t, "flash", 0.0) else "hadir"
+            elif t.cand:
+                status = "cek"
+            else:
+                status = "unknown"
+            item = {"box": [float(t.box[0] / sw), float(t.box[1] / sh), float(t.box[2] / sw), float(t.box[3] / sh)],
+                    "status": status, "skor": round(float(t.score), 2)}
+            if t.name or t.cand:
+                item["nama"] = t.name or t.cand
+            faces_out.append(item)
         db_empty = db.is_empty()
     return {"faces": faces_out, "events": events, "db_empty": db_empty}
 
 
 ROUTES = {("POST", "/api/people"): api_create, ("POST", "/api/people/samples"): api_add_samples,
           ("PUT", "/api/people"): api_update, ("DELETE", "/api/people"): api_delete}
+
+
+def pin_ok(headers):
+    return hmac.compare_digest(headers.get("X-Pin", "").encode(), PIN.encode())
 
 
 PAGE = r"""<!doctype html>
@@ -657,7 +696,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
           <div class="camsum"><span id="c-ring"></span><div><b id="c-num"></b><span class="mute" id="c-count"></span></div></div>
           <div class="feed" id="c-feed"></div>
           <ul class="tips">
-            <li>Jarak ideal 0,5 sampai 2 meter dari kamera.</li>
+            <li>Jarak ideal 0,5 sampai 3 meter dari kamera.</li>
             <li>Pastikan cahaya cukup dan wajah menghadap lurus.</li>
             <li>Kotak ungu berarti sedang memverifikasi, hijau berarti dikenali.</li>
           </ul>
@@ -731,11 +770,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const VIEWS = ['ringkasan', 'kamera', 'kelola', 'rekap'];
 const dateEl = $('date');
 dateEl.value = today();
-let view = 'ringkasan', data = null, info = null, pendingAdd = false;
+const INFO_DEFAULT = {people: [], editable: true, pin_required: false, min_samples: 3, max_images: 12};
+let view = 'ringkasan', data = null, info = {...INFO_DEFAULT}, pendingAdd = false;
 
 const pinHeader = () => { const p = sessionStorage.getItem('pin'); return p ? {'X-Pin': p} : {}; };
+const needPin = () => { $('pinbox').hidden = false; };
+let pinTimer = null;
 $('pin').value = sessionStorage.getItem('pin') || '';
-$('pin').addEventListener('input', e => sessionStorage.setItem('pin', e.target.value));
+$('pin').addEventListener('input', e => {
+  sessionStorage.setItem('pin', e.target.value);
+  clearTimeout(pinTimer);
+  pinTimer = setTimeout(() => { load(); if (view === 'kelola') loadPeople(); }, 400);
+});
 
 // ---------- tema ----------
 function applyTheme(t, save) {
@@ -777,9 +823,9 @@ function route() {
 async function load() {
   if (!dateEl.value) dateEl.value = today();
   const date = view === 'kamera' ? today() : dateEl.value;
-  $('export').href = '/export?date=' + dateEl.value;
   try {
-    const r = await fetch('/api/data?date=' + date, {cache: 'no-store'});
+    const r = await fetch('/api/data?date=' + date, {cache: 'no-store', headers: pinHeader()});
+    if (r.status === 401) { needPin(); $('status').textContent = 'Masukkan PIN admin'; $('dot').className = 'dot'; return; }
     if (!r.ok) throw new Error(r.status);
     data = await r.json();
     draw();
@@ -864,6 +910,21 @@ $('q').addEventListener('input', () => data && drawPresent());
 $('r-q').addEventListener('input', () => data && drawRecap());
 setInterval(() => { if (!document.hidden && view !== 'kelola') load(); }, 4000);
 
+// unduh CSV lewat fetch agar PIN ikut terkirim
+$('export').onclick = async e => {
+  e.preventDefault();
+  try {
+    const r = await fetch('/export?date=' + dateEl.value, {headers: pinHeader(), cache: 'no-store'});
+    if (r.status === 401) { needPin(); throw new Error('Masukkan PIN admin di sidebar.'); }
+    if (!r.ok) throw new Error('Gagal mengunduh (' + r.status + ')');
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a');
+    a.href = url; a.download = 'absensi_' + dateEl.value + '.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) { $('status').textContent = err.message; }
+};
+
 // ---------- kamera absen ----------
 const cam = {stream: null, on: false, tok: 0};
 const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#7c3aed', unknown: '#dc2626', far: '#78716c'};
@@ -885,7 +946,7 @@ async function listDevices() {
 }
 
 async function camStart() {
-  if (!info || !info.editable) { setPill('Kamera absen nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
+  if (!info.editable) { setPill('Kamera absen nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
   if (!navigator.mediaDevices) { setPill('Kamera browser hanya tersedia di localhost atau HTTPS.', true); return; }
   camStop(true);
   try {
@@ -894,10 +955,11 @@ async function camStart() {
     const v = $('c-video'); v.srcObject = cam.stream; await v.play();
   } catch (e) { setPill('Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai aplikasi lain).', true); return; }
   cam.on = true; const tok = ++cam.tok;
+  const id = Math.random().toString(36).slice(2, 12);   // satu sesi pelacak di server per kamera aktif
   $('c-idle').hidden = true; $('c-toggle').textContent = 'Hentikan kamera';
   setPill('Menunggu wajah...');
   await listDevices();
-  scanLoop(tok);
+  scanLoop(tok, id);
 }
 
 function camStop(keepUi) {
@@ -908,16 +970,17 @@ function camStop(keepUi) {
   if (!keepUi) { $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera'; }
 }
 
-async function scanLoop(tok) {
+async function scanLoop(tok, id) {
   while (cam.on && cam.tok === tok) {
+    if (document.hidden) { await sleep(500); continue; }
     const v = $('c-video');
     if (v.videoWidth) {
-      const w = Math.min(800, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth);
+      const w = Math.min(1280, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth);
       grab.width = w; grab.height = h;
       grab.getContext('2d').drawImage(v, 0, 0, w, h);
-      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.75));
+      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.72));
       try {
-        const r = await fetch('/api/scan', {method: 'POST', headers: {'Content-Type': 'image/jpeg', ...pinHeader()}, body: blob});
+        const r = await fetch('/api/scan?cam=' + id, {method: 'POST', headers: {'Content-Type': 'image/jpeg', ...pinHeader()}, body: blob});
         const j = await r.json().catch(() => ({message: 'Respons server tidak valid'}));
         if (!r.ok) throw new Error(j.message || r.status);
         if (!cam.on || cam.tok !== tok) return;
@@ -932,7 +995,7 @@ async function scanLoop(tok) {
         await sleep(1500);
       }
     }
-    await sleep(120);
+    await sleep(80);
   }
 }
 
@@ -995,7 +1058,9 @@ async function api(method, path, body) {
 
 async function loadPeople() {
   try {
-    info = await (await fetch('/api/people', {cache: 'no-store'})).json();
+    const r = await fetch('/api/people', {cache: 'no-store', headers: pinHeader()});
+    if (r.status === 401) { needPin(); say('Masukkan PIN admin di sidebar.', true); return; }
+    info = {...info, ...(await r.json())};
   } catch (e) { say('Server tidak terjangkau', true); return; }
   $('pinbox').hidden = !info.pin_required;
   $('k-add').disabled = !info.editable;
@@ -1007,6 +1072,7 @@ async function loadPeople() {
     `<button class="btn sm bad" data-a="del" data-i="${i}">Hapus</button></td></tr>`).join('')
     || '<tr><td colspan="4" class="mute">Belum ada wajah terdaftar.</td></tr>';
   if (!info.editable) say('Pengelolaan nonaktif: jalankan dashboard dengan --pin untuk mengaktifkannya dari jaringan.', true);
+  else if ($('k-msg').classList.contains('err')) say('');
   if (pendingAdd) { pendingAdd = false; if (info.editable && view === 'kelola') openDlg('add'); }
 }
 
@@ -1111,7 +1177,7 @@ $('d-cam').onclick = startCam; $('d-snap').onclick = snap; $('d-auto').onclick =
 $('d-thumbs').onclick = e => { const b = e.target.closest('button[data-rm]'); if (b) { imgs.splice(+b.dataset.rm, 1); renderThumbs(); } };
 $('d-save').onclick = save; $('d-cancel').onclick = () => $('dlg').close();
 $('dlg').addEventListener('close', stopCam);
-fetch('/api/people', {cache: 'no-store'}).then(r => r.json()).then(j => { info = j; $('pinbox').hidden = !j.pin_required; }).catch(() => {});
+fetch('/api/info', {cache: 'no-store'}).then(r => r.json()).then(j => { info = {...info, ...j}; $('pinbox').hidden = !j.pin_required; }).catch(() => {});
 route();
 </script>
 </body>
@@ -1136,6 +1202,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        if u.path == "/":
+            return self.send(200, PAGE, "text/html; charset=utf-8")
+        if u.path == "/api/info":      # publik: hanya status PIN dan mode edit
+            return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED}), JSON)
+        if u.path not in ("/api/people", "/api/data", "/export"):
+            return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
+        if PIN and not pin_ok(self.headers):   # data absensi ikut dilindungi PIN
+            return self.send(401, json.dumps({"ok": False, "message": "PIN diperlukan."}), JSON)
         if u.path == "/api/people":
             return self.send(200, json.dumps(people_info()), JSON)
         date = parse_qs(u.query).get("date", [datetime.now().strftime("%Y-%m-%d")])[0]
@@ -1143,20 +1217,15 @@ class Handler(BaseHTTPRequestHandler):
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
             return self.send(400, "Tanggal tidak valid", "text/plain; charset=utf-8")
-
-        if u.path == "/":
-            self.send(200, PAGE, "text/html; charset=utf-8")
-        elif u.path == "/api/data":
-            self.send(200, json.dumps(build(date)), "application/json; charset=utf-8")
-        elif u.path == "/export":
+        if u.path == "/api/data":
+            self.send(200, json.dumps(build(date)), JSON)
+        else:
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(["tanggal", "jam", "nama"])
             w.writerows(r for r in cached(LOG_FILE, read_rows) if r[0] == date)
-            self.send(200, buf.getvalue(), "text/csv; charset=utf-8",
+            self.send(200, "\ufeff" + buf.getvalue(), "text/csv; charset=utf-8",   # BOM agar rapi di Excel
                       {"Content-Disposition": f'attachment; filename="absensi_{date}.csv"'})
-        else:
-            self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
 
     def guard(self, ctype, limit):
         """Cek keamanan (aktif, origin, host, content-type, PIN, ukuran) lalu kembalikan isi body."""
@@ -1169,7 +1238,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "Host tidak diizinkan.")
         if not self.headers.get("Content-Type", "").startswith(ctype):
             raise ApiError(415, f"Content-Type harus {ctype}.")
-        if not hmac.compare_digest(self.headers.get("X-Pin", "").encode(), PIN.encode()):
+        if not pin_ok(self.headers):
             raise ApiError(403, "PIN salah atau belum diisi.")
         n = int(self.headers.get("Content-Length") or 0)
         if not 0 < n <= limit:
@@ -1200,8 +1269,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def scan(self):
         """Terima satu frame JPEG dari kamera browser, kembalikan wajah terdeteksi dan absen baru."""
+        q = parse_qs(urlparse(self.path).query)
+        cam = re.sub(r"[^A-Za-z0-9_-]", "", (q.get("cam") or ["default"])[0])[:40] or "default"
         try:
-            out = api_scan(self.guard("image/jpeg", MAX_FRAME))
+            out = api_scan(self.guard("image/jpeg", MAX_FRAME), cam)
             self.send(200, json.dumps({"ok": True, **out}), JSON)
         except ApiError as e:
             self.send(e.code, json.dumps({"ok": False, "message": e.msg}), JSON)
@@ -1226,12 +1297,13 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("--pin", default="", help="PIN admin untuk kamera absen dan pengelolaan wajah (wajib jika --host bukan localhost)")
+    ap.add_argument("--pin", default="", help="PIN admin untuk kamera absen, pengelolaan wajah, dan data absensi (wajib jika --host bukan localhost)")
     a = ap.parse_args()
     PIN = a.pin
     EDIT_ENABLED = a.host in ("127.0.0.1", "localhost", "::1") or bool(PIN)
     if not EDIT_ENABLED:
-        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah dinonaktifkan (hanya baca).")
+        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah dinonaktifkan "
+              "(hanya baca). Data absensi bisa dibaca siapa pun di jaringan; pakai --pin untuk melindunginya.")
 
     server = ThreadingHTTPServer((a.host, a.port), Handler)
     url = f"http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}"

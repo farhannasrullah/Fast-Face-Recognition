@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Auto Fast Face Recognition System - Absensi Sederhana
+Auto Fast Face Recognition System - Absensi Sederhana (versi optimal)
 Berjalan penuh di CPU (0 VRAM) dan hemat RAM. Model: YuNet (deteksi) + SFace (embedding).
 
 Perintah:
@@ -11,6 +11,15 @@ Perintah:
   python main.py list                                  # daftar orang terdaftar
   python main.py delete --nama "Budi"                  # hapus data satu orang
   python main.py download-models                       # unduh model YuNet + SFace
+
+Perubahan utama dibanding versi sebelumnya:
+  * Registrasi: embedding diambil dari frame bersih (sebelumnya kotak hijau ikut ter-crop).
+    Pratinjau registrasi kini dicerminkan agar "tengok kiri/kanan" terasa natural.
+  * AttendanceLogger membaca CSV secara inkremental dan selalu sinkron dengan proses lain
+    (dashboard / main.py lain), sehingga tidak ada absen ganda.
+  * Pencocokan per orang (rata-rata 2 sampel terbaik) + syarat margin antar-orang.
+  * Wajah yang sudah dikenali tidak langsung jadi Unknown karena satu frame buruk.
+  * Backend kamera V4L2 di Linux.
 """
 import argparse
 import csv
@@ -75,12 +84,14 @@ GC_EVERY_FRAMES = 900      # bersihkan memori berkala
 
 # Deteksi dan pengenalan
 NMS_THRESH = 0.3
-MATCH_THRESH = 0.40        # ambang cosine similarity (rekomendasi resmi SFace: 0.363)
+MATCH_THRESH = 0.40        # ambang skor orang (rata-rata 2 sampel terbaik; resmi SFace: 0.363)
+MATCH_MARGIN = 0.05        # selisih minimum skor orang terbaik vs kedua (0 = nonaktif)
 CONFIRM_MATCHES = 2        # kecocokan beruntun yang dibutuhkan sebelum dianggap dikenali
 UNKNOWN_RETRY_DETIK = 0.4  # jeda ekstraksi embedding ulang untuk wajah yang belum dikenali
 RECHECK_DETIK = 60         # verifikasi ulang wajah yang sudah dikenali (0 = tidak pernah)
 TRACK_IOU_MIN = 0.25
 TRACK_MAX_MISSED = 4       # siklus deteksi tanpa terdeteksi sebelum track dibuang
+WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikenali dianggap Unknown
 
 # Absensi
 COOLDOWN_MODE = "daily"    # "daily" = 1x per hari | "interval" = jeda COOLDOWN_MENIT
@@ -89,7 +100,7 @@ COOLDOWN_MENIT = 30
 # Registrasi
 REG_SAMPLES = 8
 REG_INTERVAL = 0.7         # detik antar pengambilan sampel
-REG_MIN_FACE_PX = 90        # wajah harus cukup besar saat registrasi (kualitas embedding)
+REG_MIN_FACE_PX = 90       # wajah harus cukup besar saat registrasi (kualitas embedding)
 REG_PROMPTS = ["Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan",
                "Dongak sedikit", "Tunduk sedikit", "Hadap lurus, rileks", "Senyum tipis",
                "Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan"]
@@ -155,11 +166,23 @@ def ensure_models():
 
 
 # ----------------------------- Kamera -----------------------------
+def _cam_backend():
+    if os.name == "nt":
+        return cv2.CAP_DSHOW
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    return cv2.CAP_ANY
+
+
 class Camera:
     """Baca kamera di thread terpisah dan hanya simpan frame terbaru (tanpa lag buffer)."""
 
     def __init__(self, index=CAM_INDEX):
-        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+        backend = _cam_backend()
+        self.cap = cv2.VideoCapture(index, backend)
+        if not self.cap.isOpened() and backend != cv2.CAP_ANY:   # cadangan: biarkan OpenCV memilih
+            self.cap.release()
+            self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             self.cap.release()
             raise CameraError(f"Kamera index {index} tidak terdeteksi. Periksa sambungan/izin kamera "
@@ -258,14 +281,21 @@ class FaceEngine:
 
 # ----------------------------- Database embedding -----------------------------
 class Database:
-    """Embedding di RAM sebagai matriks float32 (N,128); pencocokan dengan satu perkalian matriks."""
+    """Embedding di RAM sebagai matriks float32 (N,128).
+
+    Pencocokan dilakukan per orang: skor orang = rata-rata 2 sampel paling mirip (1 sampel bila
+    hanya ada satu). Seluruhnya vektor (satu perkalian matriks + reduceat), tanpa loop Python.
+    """
 
     def __init__(self, path=DB_PATH):
         self.path = path
         self.names, self.ids = [], []
         self.embs = np.zeros((0, 128), np.float32)
+        self._sig = None
         self._load()
+        self._reindex()
 
+    # ---- deteksi perubahan file ----
     def _sig_now(self):
         try:
             st = os.stat(self.path)
@@ -279,6 +309,7 @@ class Database:
 
     def reload(self):
         self._load()
+        self._reindex()
 
     def _load(self):
         self._sig = self._sig_now()
@@ -295,6 +326,25 @@ class Database:
             raise RuntimeError(f"Database wajah rusak/tidak terbaca ({self.path}): {e}")
         self.names, self.ids, self.embs = names, ids, embs
 
+    def _reindex(self):
+        """Susun indeks per orang (urutan sampel dikelompokkan) untuk pencocokan vektor."""
+        if not self.names:
+            self.uniq, self.uids = [], []
+            self._counts = np.zeros(0, np.intp)
+            self._starts = np.zeros(0, np.intp)
+            self._es = np.zeros((0, 128), np.float32)
+            return
+        uniq, inv = np.unique(np.array(self.names, dtype=str), return_inverse=True)
+        inv = inv.reshape(-1)
+        order = np.argsort(inv, kind="stable")
+        counts = np.bincount(inv, minlength=len(uniq)).astype(np.intp)
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1])).astype(np.intp)
+        ids = np.array(self.ids, dtype=str)
+        self._counts, self._starts = counts, starts
+        self._es = np.ascontiguousarray(self.embs[order])
+        self.uniq = [str(x) for x in uniq]
+        self.uids = [str(x) for x in ids[order[starts]]]
+
     def save(self):
         tmp = self.path + ".tmp.npz"  # tulis ke file sementara agar database tidak rusak saat crash
         np.savez_compressed(tmp, names=np.array(self.names, dtype=str),
@@ -302,6 +352,7 @@ class Database:
         os.replace(tmp, self.path)
         self._sig = self._sig_now()
 
+    # ---- data ----
     def is_empty(self):
         return len(self.names) == 0
 
@@ -320,6 +371,7 @@ class Database:
         self.names += [name] * len(samples)
         self.ids += [pid] * len(samples)
         self.embs = np.vstack([self.embs, np.asarray(samples, np.float32)])
+        self._reindex()
 
     def remove(self, name):
         keep = np.array([n != name for n in self.names], dtype=bool)
@@ -327,6 +379,7 @@ class Database:
         self.names = [n for n, k in zip(self.names, keep) if k]
         self.ids = [i for i, k in zip(self.ids, keep) if k]
         self.embs = np.ascontiguousarray(self.embs[keep])
+        self._reindex()
         return removed
 
     def update(self, name, new_name=None, pid=None):
@@ -335,35 +388,87 @@ class Database:
             self.ids = [pid if n == name else i for n, i in zip(self.names, self.ids)]
         if new_name:
             self.names = [new_name if n == name else n for n in self.names]
+        self._reindex()
+
+    # ---- pencocokan ----
+    def person_scores(self, emb):
+        """Skor tiap orang (urutan sama dengan self.uniq)."""
+        s = self._es @ emb
+        m1 = np.maximum.reduceat(s, self._starts)
+        if not (self._counts > 1).any():
+            return m1
+        s2 = np.where(s >= np.repeat(m1, self._counts), -1.0, s)   # buang sampel terbaik tiap orang
+        m2 = np.maximum.reduceat(s2, self._starts)
+        m2 = np.where(m2 < -0.5, m1, m2)                           # orang dengan 1 sampel / sampel kembar
+        return np.where(self._counts > 1, (m1 + m2) / 2, m1)
+
+    def best(self, emb):
+        """Orang paling mirip tanpa aturan margin: (nama, id, skor, margin ke orang kedua)."""
+        if not self.uniq:
+            return None, "", 0.0, 0.0
+        sc = self.person_scores(emb)
+        i = int(sc.argmax())
+        best = float(sc[i])
+        margin = best - float(np.partition(sc, -2)[-2]) if len(sc) > 1 else 1.0
+        return self.uniq[i], self.uids[i], best, margin
 
     def match(self, emb):
-        """Kembalikan (nama, id, skor cosine) sampel paling mirip (nama None jika database kosong)."""
-        if not self.names:
-            return None, "", 0.0
-        sims = self.embs @ emb
-        i = int(sims.argmax())
-        return self.names[i], self.ids[i], float(sims[i])
+        """(nama, id, skor). nama None bila database kosong atau hasil ambigu (margin terlalu kecil)."""
+        name, pid, score, margin = self.best(emb)
+        if name is not None and score >= MATCH_THRESH and margin < MATCH_MARGIN:
+            return None, "", score
+        return name, pid, score
 
 
 # ----------------------------- Pencatat absensi -----------------------------
 class AttendanceLogger:
-    """Catat absen ke CSV dengan cooldown (1x per hari, atau jeda N menit)."""
+    """Catat absen ke CSV dengan cooldown (1x per hari, atau jeda N menit).
+
+    CSV dibaca inkremental (hanya baris baru) dan disinkronkan sebelum setiap keputusan, sehingga
+    aman dipakai bersama proses lain (dashboard, main.py kedua) tanpa absen ganda.
+    """
     HEADER = ["tanggal", "jam", "nama", "id", "skor"]
 
     def __init__(self, path=LOG_PATH):
         self.path = path
         self.last = {}  # nama -> waktu catatan terakhir
-        if os.path.exists(path):
-            with open(path, newline="", encoding="utf-8") as f:
-                for r in csv.reader(f):
-                    if len(r) < 3 or r[0] == "tanggal":
-                        continue
-                    try:
-                        t = datetime.strptime(f"{r[0]} {r[1]}", "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        continue
-                    if r[2] not in self.last or t > self.last[r[2]]:
-                        self.last[r[2]] = t
+        self._pos = 0   # posisi byte terakhir yang sudah dibaca
+        self._lock = threading.RLock()
+        self.sync()
+
+    def _ingest(self, r):
+        if len(r) < 3 or r[0] == "tanggal":
+            return
+        try:
+            t = datetime.strptime(f"{r[0]} {r[1]}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return
+        if r[2] not in self.last or t > self.last[r[2]]:
+            self.last[r[2]] = t
+
+    def sync(self):
+        """Baca baris baru yang ditulis proses lain."""
+        with self._lock:
+            try:
+                size = os.stat(self.path).st_size
+            except OSError:
+                self.last.clear()
+                self._pos = 0
+                return
+            if size == self._pos:
+                return
+            if size < self._pos:  # file diganti/dipotong: baca ulang dari awal
+                self.last.clear()
+                self._pos = 0
+            with open(self.path, "rb") as f:
+                f.seek(self._pos)
+                data = f.read()
+            end = data.rfind(b"\n")
+            if end < 0:           # baris belum lengkap
+                return
+            self._pos += end + 1
+            for r in csv.reader(data[:end + 1].decode("utf-8", "replace").splitlines()):
+                self._ingest(r)
 
     def should_log(self, name, now):
         last = self.last.get(name)
@@ -374,17 +479,28 @@ class AttendanceLogger:
         return (now - last).total_seconds() >= COOLDOWN_MENIT * 60
 
     def log(self, name, pid, score, now):
-        new = not os.path.exists(self.path)
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(self.HEADER)
-            w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid, f"{score:.3f}"])
-        self.last[name] = now
+        with self._lock:
+            new = not os.path.exists(self.path)
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(self.HEADER)
+                w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid, f"{score:.3f}"])
+            self.last[name] = now
+
+    def try_log(self, name, pid, score, now):
+        """Sinkron -> cek cooldown -> tulis, satu langkah. True bila absen baru tercatat."""
+        with self._lock:
+            self.sync()
+            if not self.should_log(name, now):
+                return False
+            self.log(name, pid, score, now)
+            return True
 
     def count_today(self):
         today = datetime.now().date()
-        return sum(1 for t in self.last.values() if t.date() == today)
+        with self._lock:
+            return sum(1 for t in self.last.values() if t.date() == today)
 
 
 # ----------------------------- Pelacak wajah -----------------------------
@@ -410,6 +526,7 @@ class Track:
         self.pid = ""
         self.cand = None      # kandidat yang belum terkonfirmasi
         self.cand_n = 0
+        self.weak = 0         # skor buruk beruntun pada wajah yang sudah dikenali
         self.score = 0.0
         self.next_embed = 0.0  # waktu paling cepat untuk ekstraksi embedding berikutnya
         self.update(row)
@@ -488,12 +605,20 @@ def _recheck_delay():
 
 
 def apply_match(t, name, pid, score, now_t, logger, recheck):
-    """Perbarui status track dari hasil pencocokan; catat absen bila sudah terkonfirmasi."""
+    """Perbarui status track dari hasil pencocokan; catat absen bila sudah terkonfirmasi.
+
+    Mengembalikan datetime bila absen baru tercatat, selain itu None."""
     t.score = score
-    if score < MATCH_THRESH:
-        t.name, t.cand, t.cand_n = None, None, 0
+    if name is None or score < MATCH_THRESH:
+        if t.name is not None:
+            t.weak += 1
+            if t.weak < WEAK_TOLERANCE:   # toleransi satu frame buruk pada wajah yang sudah dikenali
+                t.next_embed = now_t + UNKNOWN_RETRY_DETIK
+                return None
+        t.name, t.cand, t.cand_n, t.weak = None, None, 0, 0
         t.next_embed = now_t + UNKNOWN_RETRY_DETIK
         return None
+    t.weak = 0
     if name == t.name:
         t.cand, t.cand_n = name, CONFIRM_MATCHES
     else:
@@ -506,10 +631,9 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
     t.name, t.pid = name, pid
     t.next_embed = now_t + recheck
     dt = datetime.now()
-    if logger.should_log(name, dt):
-        logger.log(name, pid, score, dt)
+    if logger.try_log(name, pid, score, dt):
         print(f"[ABSEN] {dt:%Y-%m-%d %H:%M:%S}  {name}  (skor {score:.2f})")
-        return f"Tercatat: {name} {dt:%H:%M:%S}"
+        return dt
     return None
 
 
@@ -527,8 +651,20 @@ def small_size(frame):
     return sw, sh, (w / sw, h / sh)
 
 
+def _clean_field(value, label, limit):
+    """Rapikan spasi dan tolak awalan yang bisa dibaca Excel sebagai rumus."""
+    s = " ".join(str(value or "").split())
+    if len(s) > limit:
+        raise ValueError(f"{label} maksimal {limit} karakter.")
+    if s[:1] in ("=", "+", "-", "@"):
+        raise ValueError(f"{label} tidak boleh diawali = + - atau @ (aman untuk Excel).")
+    return s
+
+
 # ----------------------------- Mode registrasi -----------------------------
 def register(name, pid, n_samples, cam_index):
+    name = _clean_field(name, "Nama", 60)
+    pid = _clean_field(pid, "ID", 40)
     if not name:
         raise ValueError("Nama tidak boleh kosong.")
     cv2.setNumThreads(CV_THREADS)
@@ -542,6 +678,8 @@ def register(name, pid, n_samples, cam_index):
             frame = next_frame(cam)
             if frame is None:
                 continue
+            show = cv2.flip(frame, 1)    # pratinjau cermin; `frame` tetap bersih untuk embedding
+            fw = frame.shape[1]
             sw, sh, scale = small_size(frame)
             faces = engine.detect(cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA))
             faces = [f for f in faces if f[2] * scale[0] >= REG_MIN_FACE_PX * 0.5]  # abaikan wajah kecil di latar
@@ -550,17 +688,18 @@ def register(name, pid, n_samples, cam_index):
                 big = bw >= REG_MIN_FACE_PX
                 msg = REG_PROMPTS[len(samples) % len(REG_PROMPTS)] if big else "Dekatkan wajah ke kamera"
                 color = (0, 220, 0) if big else (0, 165, 255)
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
                 if big and time.time() - last >= REG_INTERVAL:
-                    samples.append(engine.embed(frame, faces[0], scale))
+                    samples.append(engine.embed(frame, faces[0], scale))   # dari frame bersih
                     last = time.time()
+                mx = fw - x - bw                                           # koordinat pada pratinjau cermin
+                cv2.rectangle(show, (mx, y), (mx + bw, y + bh), color, 2)
             elif not faces:
                 msg, color = "Wajah belum terlihat / terlalu jauh", (0, 0, 255)
             else:
                 msg, color = "Harus satu wajah saja di depan kamera", (0, 0, 255)
-            put_text(frame, f"{name}: sampel {len(samples)}/{n_samples}", (10, 24), (255, 255, 255), 0.7)
-            put_text(frame, msg, (10, frame.shape[0] - 14), color, 0.7)
-            cv2.imshow(WIN_REG, frame)
+            put_text(show, f"{name}: sampel {len(samples)}/{n_samples}", (10, 24), (255, 255, 255), 0.7)
+            put_text(show, msg, (10, show.shape[0] - 14), color, 0.7)
+            cv2.imshow(WIN_REG, show)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
     finally:
@@ -573,7 +712,7 @@ def register(name, pid, n_samples, cam_index):
     mean = np.mean(samples, axis=0)
     mean /= np.linalg.norm(mean)
     if not db.is_empty():
-        other, _, sc = db.match(mean)
+        other, _, sc, _ = db.best(mean)
         if other != name and sc >= 0.5:
             print(f"PERINGATAN: wajah ini sangat mirip dengan '{other}' (skor {sc:.2f}). "
                   "Pastikan tidak terdaftar ganda dengan nama berbeda.")
@@ -600,7 +739,7 @@ def run_absen(cam_index, headless=False):
     far = []  # wajah terdeteksi tetapi terlalu kecil (jauh)
     frame_no, fps, t_prev = 0, 0.0, time.perf_counter()
     ram_mb, ram_t, toast, toast_t = None, 0.0, "", 0.0
-    db_t = 0.0  # waktu terakhir mengecek perubahan database
+    db_t = 0.0  # waktu terakhir mengecek perubahan database / log
     try:
         while True:
             frame = next_frame(cam)
@@ -621,8 +760,9 @@ def run_absen(cam_index, headless=False):
             gi, have_prev = 1 - gi, True
 
             now_t = time.time()
-            if now_t - db_t > 2.0:                   # muat ulang bila database diubah (mis. dari dashboard)
+            if now_t - db_t > 2.0:                   # sinkron log dan muat ulang database bila berubah
                 db_t = now_t
+                logger.sync()
                 if db.changed():
                     try:
                         db.reload()
@@ -637,10 +777,10 @@ def run_absen(cam_index, headless=False):
                 far = [f for f in faces if MIN_FACE_PX * 0.5 <= f[2] * scale[0] < MIN_FACE_PX]
                 for t in tracker.update(near):
                     if now_t >= t.next_embed:        # embedding hanya jika perlu
-                        msg = apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
-                                          now_t, logger, recheck)
-                        if msg:
-                            toast, toast_t = msg, now_t
+                        dt = apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
+                                         now_t, logger, recheck)
+                        if dt:
+                            toast, toast_t = f"Tercatat: {t.name} {dt:%H:%M:%S}", now_t
 
             t_now = time.perf_counter()
             inst = 1.0 / max(t_now - t_prev, 1e-6)
