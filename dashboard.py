@@ -1,9 +1,19 @@
 """
 Dashboard Admin Absensi Wajah (versi optimal) - gaya UI selaras dengan chat RAG (netral hangat, aksen ungu).
 
-Halaman  : Ringkasan | Kamera absen (built-in di browser) | Kelola wajah (CRUD) | Rekap
+Halaman  : Ringkasan | Kamera absen | Kelola wajah (CRUD) | Rekap
 Tema     : Otomatis (ikut sistem) / Terang / Gelap, pilihan tersimpan di browser.
 Membaca/menulis absensi.csv dan faces_db.npz milik main.py (letakkan di folder yang sama).
+
+Aturan absensi (sama dengan main.py): masuk setelah JAM_TERLAMBAT = terlambat; scan setelah JAM_PULANG
+dari orang yang sudah masuk = absen pulang; semua status di-reset otomatis tiap hari.
+
+Kamera absen punya dua sumber:
+  * Kamera server  : server membaca kamera komputer ini langsung lewat OpenCV dan memakai alur yang
+                     sama dengan 'main.py run' (deteksi tiap 3 frame + optical flow). Paling cepat.
+                     Tidak bisa dipakai bersamaan dengan 'main.py run' (rebutan kamera).
+  * Kamera browser : kamera perangkat yang membuka halaman (HP/PC lain). Browser hanya mengizinkan kamera
+                     di localhost atau HTTPS.
 
 Jalankan : python dashboard.py
 Buka     : http://127.0.0.1:8000  (otomatis terbuka di browser)
@@ -13,14 +23,7 @@ Opsi     : --port 8000
            --pin 1234       (wajib jika dibuka dari jaringan; melindungi kamera absen, pengelolaan
                              wajah, DAN pembacaan data absensi)
 
-Kamera absen memakai kamera browser. Browser hanya mengizinkan kamera di localhost atau HTTPS,
-jadi untuk perangkat lain di jaringan gunakan HTTPS (mis. reverse proxy) atau buka dari komputer ini.
 PIN dikirim apa adanya lewat HTTP biasa; di jaringan yang tidak tepercaya pakai HTTPS.
-Boleh berjalan bersamaan dengan 'main.py run': log absen selalu disinkronkan, jadi tidak ada absen ganda.
-
-Perubahan utama: kamera web memakai pelacak wajah + throttle embedding (seperti main.py), frame 1280px
-agar jangkauan sama dengan main.py, satu logger bersama (tanpa parse ulang CSV), cache hasil statistik,
-dan endpoint baca ikut dilindungi PIN.
 """
 import argparse
 import base64
@@ -41,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "absensi.csv")
 DB_FILE = os.path.join(BASE, "faces_db.npz")
+JAM_TERLAMBAT = "09:00:00"   # HARUS sama dengan main.py; dipakai untuk baris lama tanpa kolom status
 _cache = {}
 _build_cache = {}
 
@@ -65,12 +69,15 @@ def cached(path, loader):
 
 
 def read_rows(path):
+    """Baris absensi: (tanggal, jam, nama, tipe, status). Baris lama 5 kolom dianggap tipe 'masuk'."""
     rows = []
     if path:
         with open(path, newline="", encoding="utf-8") as f:
             for r in csv.reader(f):
                 if len(r) >= 3 and r[0] != "tanggal":
-                    rows.append((r[0], r[1], r[2]))
+                    tipe = r[5] if len(r) > 5 and r[5] else "masuk"
+                    st = r[6] if len(r) > 6 and r[6] else ("terlambat" if r[1] > JAM_TERLAMBAT else "hadir")
+                    rows.append((r[0], r[1], r[2], tipe, st))
     return rows
 
 
@@ -88,26 +95,39 @@ def read_names(path):
 def _build(date):
     rows = cached(LOG_FILE, read_rows)
     registered = cached(DB_FILE, read_names)
-    present = sorted(((j, n) for d, j, n in rows if d == date), reverse=True)
-    here = {n for _, n in present}
+
+    masuk, pulang = {}, {}                  # status hari terpilih
+    for d, j, n, tipe, st in rows:
+        if d != date:
+            continue
+        if tipe == "pulang":
+            pulang[n] = max(pulang.get(n, ""), j)
+        elif n not in masuk or j < masuk[n][0]:
+            masuk[n] = (j, st)
+    present = sorted(({"jam": j, "nama": n, "status": st, "pulang": pulang.get(n, "")}
+                      for n, (j, st) in masuk.items()), key=lambda p: p["jam"], reverse=True)
+    here = set(masuk)
 
     end = datetime.strptime(date, "%Y-%m-%d")
     days = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
-    per_day, days_by_name, recap = {}, {}, {}
-    for d, j, n in rows:
-        per_day.setdefault(d, set()).add(n)
-        days_by_name.setdefault(n, set()).add(d)
-        r = recap.setdefault(n, {"nama": n, "total": 0, "days": 0, "last": ""})
+    per_day, first, recap = {}, {}, {}
+    for d, j, n, tipe, st in rows:
+        r = recap.setdefault(n, {"nama": n, "total": 0, "days": 0, "late": 0, "last": ""})
         r["total"] += 1
         r["last"] = max(r["last"], f"{d} {j}")
-    for n, r in recap.items():          # jumlah hari berbeda tempat orang ini tercatat hadir
-        r["days"] = len(days_by_name[n])
+        if tipe == "masuk" and (n, d) not in first:      # catatan masuk pertama per orang per hari
+            first[(n, d)] = st
+            per_day.setdefault(d, set()).add(n)
+    for (n, d), st in first.items():
+        recap[n]["days"] += 1
+        recap[n]["late"] += st == "terlambat"
 
     total = len(registered)
     return {
         "date": date,
         "registered": total,
-        "present": [{"jam": j, "nama": n} for j, n in present],
+        "present": present,
+        "late": sum(1 for p in present if p["status"] == "terlambat"),
         "absent": [n for n in registered if n not in here],
         "pct": min(100, round(100 * len(here) / total)) if total else 0,
         "trend": [{"date": d, "count": len(per_day.get(d, ()))} for d in days],
@@ -331,7 +351,7 @@ def api_delete(d):
     return {"message": f"{name} dihapus ({removed} sampel). Riwayat absensi tidak ikut terhapus."}
 
 
-# ----------------------------- Kamera absen (frame dari browser) -----------------------------
+# ----------------------------- Kamera absen: frame dari browser -----------------------------
 def scan_db(main):
     """Database untuk pemindaian; dimuat ulang otomatis bila file berubah."""
     db = _core.get("db")
@@ -380,11 +400,13 @@ def api_scan(raw, cam):
             fresh = tracker.update(near)
             for t in fresh:
                 if now >= t.next_embed:       # embedding hanya bila perlu (sama seperti main.py)
-                    dt = main.apply_match(t, *db.match(engine.embed(img, t.row, scale)),
-                                          now, logger, recheck)
-                    if dt:
+                    res = main.apply_match(t, *db.match(engine.embed(img, t.row, scale)),
+                                           now, logger, recheck)
+                    if res:
+                        dt, tipe, st = res
                         t.flash = now + 2.0
-                        events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S")})
+                        events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S"),
+                                       "tipe": tipe, "status": st})
         for f in far:
             faces_out.append({"box": [float(f[0] / sw), float(f[1] / sh), float(f[2] / sw), float(f[3] / sh)],
                               "status": "far"})
@@ -404,8 +426,151 @@ def api_scan(raw, cam):
     return {"faces": faces_out, "events": events, "db_empty": db_empty}
 
 
+# ----------------------------- Kamera absen: kamera server (seperti main.py) -----------------------------
+class ServerScanner:
+    """Baca kamera langsung di server dan jalankan alur yang sama dengan main.py run."""
+    IDLE_STOP = 30.0   # detik tanpa permintaan frame dari browser -> kamera dilepas
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_ev = threading.Event()
+        self.running, self.jpeg, self.err = False, None, ""
+        self.fps, self.events, self.last_req = 0.0, [], 0.0
+        self.th = None
+
+    def start(self, cam_index):
+        with self.lock:
+            if self.running:
+                self.last_req = time.time()
+                return
+            main, engine = get_main(), get_engine()
+            cam = main.Camera(cam_index)          # lempar CameraError bila gagal
+            self.stop_ev.clear()
+            self.err, self.jpeg, self.events = "", None, []
+            self.last_req, self.running = time.time(), True
+            self.th = threading.Thread(target=self._loop, args=(main, engine, cam), daemon=True)
+            self.th.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        th = self.th
+        if th:
+            th.join(timeout=3.0)
+
+    def status(self):
+        with self.lock:
+            ev, self.events = self.events, []
+            return {"running": self.running, "fps": round(self.fps), "err": self.err, "events": ev}
+
+    def _loop(self, main, engine, cam):
+        np, cv2 = main.np, main.cv2
+        try:
+            db, logger, tracker = main.Database(DB_FILE), get_logger(main), main.Tracker()
+            recheck = main._recheck_delay()
+            small = gbuf = None
+            gi, have_prev, far = 0, False, []
+            n, fps, t_prev, db_t = 0, 0.0, time.perf_counter(), 0.0
+            while not self.stop_ev.is_set():
+                now_t = time.time()
+                if now_t - self.last_req > self.IDLE_STOP:
+                    break
+                frame = main.next_frame(cam)
+                if frame is None:
+                    continue
+                n += 1
+                sw, sh, scale = main.small_size(frame)
+                if small is None or small.shape[:2] != (sh, sw):
+                    small = np.empty((sh, sw, 3), np.uint8)
+                    gbuf = [np.empty((sh, sw), np.uint8), np.empty((sh, sw), np.uint8)]
+                    have_prev = False
+                    tracker.tracks.clear()
+                cv2.resize(frame, (sw, sh), dst=small, interpolation=cv2.INTER_AREA)
+                gray, prev = gbuf[gi], gbuf[1 - gi]
+                cv2.cvtColor(small, cv2.COLOR_BGR2GRAY, dst=gray)
+                if have_prev:
+                    tracker.advance(prev, gray)
+                gi, have_prev = 1 - gi, True
+
+                if now_t - db_t > 2.0:                       # sinkron log dan muat ulang database
+                    db_t = now_t
+                    logger.sync()
+                    if db.changed():
+                        try:
+                            db.reload()
+                        except RuntimeError:
+                            pass
+                        for t in tracker.tracks.values():
+                            t.next_embed = 0.0
+                if n % main.DETECT_EVERY == 0:
+                    with ENGINE_LOCK:
+                        faces = engine.detect(small)
+                        near = [f for f in faces if f[2] * scale[0] >= main.MIN_FACE_PX]
+                        far = [f for f in faces
+                               if main.MIN_FACE_PX * 0.5 <= f[2] * scale[0] < main.MIN_FACE_PX]
+                        for t in tracker.update(near):
+                            if now_t >= t.next_embed:
+                                res = main.apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
+                                                       now_t, logger, recheck)
+                                if res:
+                                    dt, tipe, st = res
+                                    with self.lock:
+                                        self.events = (self.events + [{
+                                            "nama": t.name, "tipe": tipe, "status": st,
+                                            "jam": dt.strftime("%H:%M:%S")}])[-20:]
+
+                # gambar kotak langsung di frame (sama seperti main.py)
+                k = np.array([*scale, *scale], np.float32)
+                for f in far:
+                    x, y, bw, bh = (int(v) for v in f[:4] * k)
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
+                    main.put_text(frame, "Terlalu jauh", (x, max(y - 6, 14)), (210, 210, 210), 0.5)
+                for t in tracker.tracks.values():
+                    if t.missed > 1:
+                        continue
+                    x, y, bw, bh = (int(v) for v in t.box * k)
+                    if t.name:
+                        color, label = (0, 200, 0), f"{t.name} {t.score:.2f}"
+                    elif t.cand:
+                        color, label = (0, 200, 255), f"{t.cand}? {t.score:.2f}"
+                    else:
+                        color, label = (0, 0, 255), f"Unknown {t.score:.2f}"
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+                    main.put_text(frame, label, (x, max(y - 6, 14)), color)
+                t_now = time.perf_counter()
+                inst = 1.0 / max(t_now - t_prev, 1e-6)
+                fps, t_prev = (inst if fps == 0 else 0.9 * fps + 0.1 * inst), t_now
+                self.fps = fps
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    self.jpeg = buf.tobytes()
+        except Exception as e:
+            self.err = str(e)
+        finally:
+            cam.close()
+            with self.lock:
+                self.running, self.jpeg = False, None
+
+
+scanner = ServerScanner()
+
+
+def api_cam_start(d):
+    try:
+        scanner.start(int(d.get("kamera") or 0))
+    except Exception as e:
+        raise ApiError(500, str(e))
+    return {"message": "Kamera server aktif."}
+
+
+def api_cam_stop(d):
+    scanner.stop()
+    return {"message": "Kamera server dihentikan."}
+
+
 ROUTES = {("POST", "/api/people"): api_create, ("POST", "/api/people/samples"): api_add_samples,
-          ("PUT", "/api/people"): api_update, ("DELETE", "/api/people"): api_delete}
+          ("PUT", "/api/people"): api_update, ("DELETE", "/api/people"): api_delete,
+          ("POST", "/api/server-cam/start"): api_cam_start,
+          ("POST", "/api/server-cam/stop"): api_cam_stop}
 
 
 def pin_ok(headers):
@@ -557,6 +722,8 @@ th{font-size:13px;color:var(--mute);font-weight:500;position:sticky;top:0;backgr
 .av{width:30px;height:30px;border-radius:50%;background:var(--soft);color:var(--acc);display:grid;place-items:center;font-weight:700;font-size:13px;flex:none}
 #absent{display:flex;flex-wrap:wrap;gap:var(--s2)}
 .chip{display:inline-block;padding:var(--s1) var(--s3);border-radius:999px;background:var(--soft);color:var(--acc);font-size:14px}
+.chip.late{background:var(--warn-soft);color:var(--warn)}
+.chip.ok{background:var(--ok-soft);color:var(--ok)}
 .pcell{display:flex;align-items:center;gap:var(--s3)}
 
 /* kamera */
@@ -665,7 +832,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
 
         <div class="card c7">
           <div class="card-h"><h2>Kedatangan terbaru</h2><input type="search" id="q" placeholder="Cari nama" aria-label="Cari nama"></div>
-          <div class="scroll"><table><thead><tr><th>Nama</th><th>Jam</th></tr></thead><tbody id="present"></tbody></table></div>
+          <div class="scroll"><table><thead><tr><th>Nama</th><th>Masuk</th><th>Status</th><th>Pulang</th></tr></thead><tbody id="present"></tbody></table></div>
         </div>
         <div class="card c5"><div class="card-h"><h2>Belum hadir</h2><span class="meta" id="a-count"></span></div><div id="absent"></div></div>
       </div>
@@ -686,6 +853,10 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
             <div class="toast" id="c-toast"></div>
           </div>
           <div class="ctrl">
+            <select id="c-src" aria-label="Sumber kamera">
+              <option value="server">Kamera server (seperti main.py)</option>
+              <option value="browser">Kamera browser</option>
+            </select>
             <button class="btn pri" id="c-toggle" type="button">Mulai kamera</button>
             <select id="c-dev" aria-label="Pilih kamera" hidden></select>
             <button class="btn" id="c-full" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>Layar penuh</button>
@@ -698,7 +869,8 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
           <ul class="tips">
             <li>Jarak ideal 0,5 sampai 3 meter dari kamera.</li>
             <li>Pastikan cahaya cukup dan wajah menghadap lurus.</li>
-            <li>Kotak ungu berarti sedang memverifikasi, hijau berarti dikenali.</li>
+            <li>Kotak kuning berarti sedang memverifikasi, hijau berarti dikenali.</li>
+            <li>Kamera server memakai kamera komputer ini dan tidak bisa berjalan bersamaan dengan main.py run.</li>
           </ul>
         </div>
       </div>
@@ -727,7 +899,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
       <div class="card">
         <div class="card-h"><h2>Per orang</h2><input type="search" id="r-q" placeholder="Cari nama" aria-label="Cari nama"></div>
         <div class="scroll tall"><table>
-        <thead><tr><th>Nama</th><th>Kehadiran</th><th>Total catatan</th><th>Terakhir hadir</th></tr></thead>
+        <thead><tr><th>Nama</th><th>Kehadiran</th><th>Terlambat</th><th>Total catatan</th><th>Terakhir hadir</th></tr></thead>
         <tbody id="recap"></tbody>
       </table></div></div>
     </section>
@@ -811,7 +983,7 @@ $('scrim').onclick = closeNav;
 function route() {
   const h = location.hash.slice(1);
   const next = VIEWS.includes(h) ? h : 'ringkasan';
-  if (view === 'kamera' && next !== 'kamera') camStop();
+  if (view === 'kamera' && next !== 'kamera') { camStop(); srvStop(); }
   view = next;
   VIEWS.forEach(v => { $('v-' + v).hidden = v !== view; $('n-' + v).classList.toggle('on', v === view); });
   closeNav();
@@ -856,7 +1028,7 @@ function drawSummary() {
   $('s-pct').textContent = data.pct + '%';
   const arc = $('h-arc');
   arc.setAttribute('stroke-dasharray', data.pct + ' 100'); arc.style.opacity = data.pct ? 1 : 0;
-  $('h-cap').textContent = t ? `${n} dari ${t} orang sudah hadir` : 'Belum ada wajah terdaftar';
+  $('h-cap').textContent = t ? `${n} dari ${t} orang sudah hadir` + (data.late ? `, ${data.late} terlambat` : '') : 'Belum ada wajah terdaftar';
   $('h-last').textContent = n ? `Terakhir: ${data.present[0].nama} pukul ${data.present[0].jam}` : 'Belum ada kedatangan';
   $('s-hadir').textContent = n;
   $('s-belum').textContent = t ? data.absent.length : '-';
@@ -878,8 +1050,11 @@ function drawPresent() {
   const q = $('q').value.trim().toLowerCase();
   const rows = data.present.filter(p => p.nama.toLowerCase().includes(q));
   $('present').innerHTML = rows.map(p =>
-    `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td class="num">${esc(p.jam)}</td></tr>`).join('')
-    || `<tr><td colspan="2" class="mute">${q ? 'Nama tidak ditemukan.' : 'Belum ada yang hadir pada tanggal ini.'}</td></tr>`;
+    `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td>` +
+    `<td class="num">${esc(p.jam)}</td>` +
+    `<td><span class="chip ${p.status === 'terlambat' ? 'late' : 'ok'}">${p.status === 'terlambat' ? 'Terlambat' : 'Hadir'}</span></td>` +
+    `<td class="num">${p.pulang ? esc(p.pulang) : '<span class="mute">-</span>'}</td></tr>`).join('')
+    || `<tr><td colspan="4" class="mute">${q ? 'Nama tidak ditemukan.' : 'Belum ada yang hadir pada tanggal ini.'}</td></tr>`;
 }
 
 function drawRecap() {
@@ -891,8 +1066,9 @@ function drawRecap() {
     const p = Math.min(100, Math.round(100 * r.days / wd));
     return `<tr><td><div class="who"><span class="av">${esc(ini(r.nama))}</span>${esc(r.nama)}</div></td>` +
       `<td><div class="pcell">${ring(p, 42, 12, p + '%', tone(p))}<span class="mute num">${r.days} hari</span></div></td>` +
+      `<td class="num">${r.late ? `<span class="chip late">${r.late} hari</span>` : '<span class="mute">-</span>'}</td>` +
       `<td class="num">${r.total}</td><td class="num">${esc(r.last)}</td></tr>`;
-  }).join('') || '<tr><td colspan="4" class="mute">Belum ada data absensi.</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="mute">Belum ada data absensi.</td></tr>';
 }
 
 function drawFeed() {
@@ -901,7 +1077,7 @@ function drawFeed() {
   $('c-num').textContent = t ? `${n} dari ${t} orang` : `${n} orang`;
   $('c-count').textContent = 'hadir hari ini';
   $('c-feed').innerHTML = data.present.slice(0, 8).map(p =>
-    `<div class="row2"><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div><span class="mute num">${esc(p.jam)}</span></div>`).join('')
+    `<div class="row2"><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div><span class="mute num">${esc(p.jam)}${p.pulang ? ' → ' + esc(p.pulang) : ''}</span></div>`).join('')
     || '<p class="mute">Belum ada yang hadir.</p>';
 }
 
@@ -927,7 +1103,8 @@ $('export').onclick = async e => {
 
 // ---------- kamera absen ----------
 const cam = {stream: null, on: false, tok: 0};
-const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#7c3aed', unknown: '#dc2626', far: '#78716c'};
+const srv = {on: false, tok: 0};
+const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#d97706', unknown: '#dc2626', far: '#78716c'};
 const grab = document.createElement('canvas');
 let toastTimer = null, reloadTimer = null;
 
@@ -945,6 +1122,7 @@ async function listDevices() {
   } catch (e) { /* abaikan */ }
 }
 
+// --- sumber: kamera browser (frame dikirim ke server) ---
 async function camStart() {
   if (!info.editable) { setPill('Kamera absen nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
   if (!navigator.mediaDevices) { setPill('Kamera browser hanya tersedia di localhost atau HTTPS.', true); return; }
@@ -963,6 +1141,7 @@ async function camStart() {
 }
 
 function camStop(keepUi) {
+  if (!cam.on && !cam.stream) return;
   cam.on = false; cam.tok++;
   if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
   cam.stream = null; $('c-video').srcObject = null;
@@ -1017,7 +1196,7 @@ function drawFaces(list) {
     const x = L.ox + (1 - bx - bw) * L.dw, y = L.oy + by * L.dh, w = bw * L.dw, h = bh * L.dh;   // video dicerminkan
     const col = COL[f.status] || COL.unknown;
     const text = f.status === 'tercatat' ? `✓ ${f.nama} · Tercatat`
-      : f.status === 'hadir' ? `${f.nama} · Sudah hadir`
+      : f.status === 'hadir' ? `${f.nama} · Sudah dikenali`
       : f.status === 'cek' ? `${f.nama}?`
       : f.status === 'far' ? 'Terlalu jauh' : 'Tidak dikenal';
     g.strokeStyle = col; g.lineWidth = 2.5; g.beginPath();
@@ -1033,12 +1212,72 @@ function drawFaces(list) {
 
 function showToast(e) {
   const t = $('c-toast');
-  t.innerHTML = `<span class="av">${esc(ini(e.nama))}</span>Tercatat: ${esc(e.nama)} · ${esc(e.jam)}`;
+  const aksi = e.tipe === 'pulang' ? 'Pulang' : (e.status === 'terlambat' ? 'Terlambat' : 'Hadir');
+  t.innerHTML = `<span class="av">${esc(ini(e.nama))}</span>${aksi}: ${esc(e.nama)} · ${esc(e.jam)}`;
   t.classList.add('show'); clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
-$('c-toggle').onclick = () => cam.on ? camStop() : camStart();
+// --- sumber: kamera server (server membaca kamera, sama seperti main.py) ---
+async function srvStart() {
+  if (!info.editable) { setPill('Kamera server nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
+  setPill('Membuka kamera server...');
+  try { await api('POST', '/api/server-cam/start', {kamera: 0}); }
+  catch (e) { setPill(e.message, true); return; }
+  srv.on = true; const tok = ++srv.tok;
+  $('c-idle').hidden = true; $('c-toggle').textContent = 'Hentikan kamera';
+  setPill('Menunggu wajah...');
+  srvLoop(tok);
+}
+
+async function srvStop() {
+  if (!srv.on) return;
+  srv.on = false; srv.tok++;
+  try { await api('POST', '/api/server-cam/stop', {}); } catch (e) { /* abaikan */ }
+  const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
+  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera';
+}
+
+async function srvLoop(tok) {
+  let lastStatus = 0;
+  while (srv.on && srv.tok === tok) {
+    if (document.hidden) { await sleep(500); continue; }
+    try {
+      const r = await fetch('/api/server-cam/frame', {cache: 'no-store', headers: pinHeader()});
+      if (r.status === 401 || r.status === 403) throw new Error('PIN salah atau kamera server nonaktif.');
+      if (r.ok && r.status !== 204) {
+        const bmp = await createImageBitmap(await r.blob());
+        if (!srv.on || srv.tok !== tok) { bmp.close(); return; }
+        const L = layout(), g = $('c-canvas').getContext('2d');
+        const s = Math.min(L.cw / bmp.width, L.ch / bmp.height);
+        const dw = bmp.width * s, dh = bmp.height * s;
+        g.setTransform(L.dpr, 0, 0, L.dpr, 0, 0); g.clearRect(0, 0, L.cw, L.ch);
+        g.drawImage(bmp, (L.cw - dw) / 2, (L.ch - dh) / 2, dw, dh); bmp.close();
+      }
+      if (Date.now() - lastStatus > 1000) {
+        lastStatus = Date.now();
+        const j = await (await fetch('/api/server-cam/status', {cache: 'no-store', headers: pinHeader()})).json();
+        j.events.forEach(showToast);
+        if (j.events.length) { clearTimeout(reloadTimer); reloadTimer = setTimeout(load, 300); }
+        if (!j.running) {
+          srv.on = false; setPill(j.err || 'Kamera server berhenti.', true);
+          $('c-idle').hidden = false; $('c-toggle').textContent = 'Mulai kamera'; return;
+        }
+        setPill(`Kamera server aktif · ${j.fps} FPS`);
+      }
+    } catch (e) {
+      if (srv.tok !== tok) return;
+      setPill(e.message, true); await sleep(1500);
+    }
+    await sleep(40);
+  }
+}
+
+$('c-toggle').onclick = () => {
+  if (cam.on) camStop();
+  else if (srv.on) srvStop();
+  else if ($('c-src').value === 'server') srvStart(); else camStart();
+};
 $('c-dev').onchange = () => cam.on && camStart();
 $('c-full').onclick = () => { const s = $('stage'); document.fullscreenElement ? document.exitFullscreen() : s.requestFullscreen && s.requestFullscreen(); };
 
@@ -1200,16 +1439,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def send_bytes(self, code, b, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8")
         if u.path == "/api/info":      # publik: hanya status PIN dan mode edit
             return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED}), JSON)
-        if u.path not in ("/api/people", "/api/data", "/export"):
+        if u.path not in ("/api/people", "/api/data", "/export",
+                          "/api/server-cam/frame", "/api/server-cam/status"):
             return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
         if PIN and not pin_ok(self.headers):   # data absensi ikut dilindungi PIN
             return self.send(401, json.dumps({"ok": False, "message": "PIN diperlukan."}), JSON)
+        if u.path == "/api/server-cam/frame":
+            if not EDIT_ENABLED:
+                return self.send(403, "Nonaktif", "text/plain; charset=utf-8")
+            scanner.last_req = time.time()
+            jpg = scanner.jpeg
+            if jpg is None:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            return self.send_bytes(200, jpg, "image/jpeg")
+        if u.path == "/api/server-cam/status":
+            if scanner.running:
+                scanner.last_req = time.time()
+            return self.send(200, json.dumps(scanner.status()), JSON)
         if u.path == "/api/people":
             return self.send(200, json.dumps(people_info()), JSON)
         date = parse_qs(u.query).get("date", [datetime.now().strftime("%Y-%m-%d")])[0]
@@ -1222,8 +1485,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             buf = io.StringIO()
             w = csv.writer(buf)
-            w.writerow(["tanggal", "jam", "nama"])
-            w.writerows(r for r in cached(LOG_FILE, read_rows) if r[0] == date)
+            w.writerow(["tanggal", "jam", "nama", "tipe", "status"])
+            w.writerows((d, j, n, t, s) for d, j, n, t, s in cached(LOG_FILE, read_rows) if d == date)
             self.send(200, "\ufeff" + buf.getvalue(), "text/csv; charset=utf-8",   # BOM agar rapi di Excel
                       {"Content-Disposition": f'attachment; filename="absensi_{date}.csv"'})
 
@@ -1315,6 +1578,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        scanner.stop()
         server.server_close()
 
 

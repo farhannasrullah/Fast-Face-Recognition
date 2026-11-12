@@ -12,14 +12,15 @@ Perintah:
   python main.py delete --nama "Budi"                  # hapus data satu orang
   python main.py download-models                       # unduh model YuNet + SFace
 
-Perubahan utama dibanding versi sebelumnya:
-  * Registrasi: embedding diambil dari frame bersih (sebelumnya kotak hijau ikut ter-crop).
-    Pratinjau registrasi kini dicerminkan agar "tengok kiri/kanan" terasa natural.
-  * AttendanceLogger membaca CSV secara inkremental dan selalu sinkron dengan proses lain
-    (dashboard / main.py lain), sehingga tidak ada absen ganda.
-  * Pencocokan per orang (rata-rata 2 sampel terbaik) + syarat margin antar-orang.
-  * Wajah yang sudah dikenali tidak langsung jadi Unknown karena satu frame buruk.
-  * Backend kamera V4L2 di Linux.
+Aturan absensi (atur di bagian KONFIGURASI):
+  * Scan pertama hari itu sampai JAM_TERLAMBAT (09:00)  -> MASUK, status "hadir".
+  * Scan pertama setelah JAM_TERLAMBAT                  -> MASUK, status "terlambat".
+  * Scan setelah JAM_PULANG (11:00) dari orang yang sudah masuk (hadir/terlambat) dan sudah
+    lewat MIN_DURASI_MENIT sejak masuk                  -> PULANG (sekali per hari).
+  * Semua status di-reset otomatis setiap hari (dibandingkan per tanggal, tanpa restart).
+
+Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
+  (baris lama 5 kolom tetap terbaca: dianggap tipe "masuk", status dihitung dari jamnya).
 """
 import argparse
 import csv
@@ -94,8 +95,9 @@ TRACK_MAX_MISSED = 4       # siklus deteksi tanpa terdeteksi sebelum track dibua
 WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikenali dianggap Unknown
 
 # Absensi
-COOLDOWN_MODE = "daily"    # "daily" = 1x per hari | "interval" = jeda COOLDOWN_MENIT
-COOLDOWN_MENIT = 30
+JAM_TERLAMBAT = "09:00:00"  # masuk setelah jam ini = terlambat (format HH:MM:SS)
+JAM_PULANG = "11:00:00"     # scan setelah jam ini (dan sudah masuk) = absen pulang
+MIN_DURASI_MENIT = 30       # jarak minimum masuk -> pulang (mencegah masuk jam 11:05 langsung pulang)
 
 # Registrasi
 REG_SAMPLES = 8
@@ -422,19 +424,31 @@ class Database:
 
 # ----------------------------- Pencatat absensi -----------------------------
 class AttendanceLogger:
-    """Catat absen ke CSV dengan cooldown (1x per hari, atau jeda N menit).
+    """Catat absen masuk (hadir/terlambat) dan pulang ke CSV. Status di-reset otomatis tiap hari.
 
     CSV dibaca inkremental (hanya baris baru) dan disinkronkan sebelum setiap keputusan, sehingga
-    aman dipakai bersama proses lain (dashboard, main.py kedua) tanpa absen ganda.
+    aman dipakai bersama proses lain (dashboard, main.py kedua) tanpa catatan ganda.
     """
-    HEADER = ["tanggal", "jam", "nama", "id", "skor"]
+    HEADER = ["tanggal", "jam", "nama", "id", "skor", "tipe", "status"]
 
     def __init__(self, path=LOG_PATH):
         self.path = path
-        self.last = {}  # nama -> waktu catatan terakhir
-        self._pos = 0   # posisi byte terakhir yang sudah dibaca
+        self.state = {}  # nama -> {"tgl": date, "masuk": datetime|None, "status": str, "pulang": datetime|None}
+        self._pos = 0    # posisi byte terakhir yang sudah dibaca
         self._lock = threading.RLock()
         self.sync()
+
+    def _apply(self, nama, t, tipe, status):
+        """Perbarui status harian satu orang. Hari yang berbeda = mulai dari nol (reset harian)."""
+        s = self.state.get(nama)
+        if s is None or s["tgl"] != t.date():
+            if s is not None and t.date() < s["tgl"]:   # baris lama dari hari sebelumnya: abaikan
+                return
+            s = self.state[nama] = {"tgl": t.date(), "masuk": None, "status": "", "pulang": None}
+        if tipe == "pulang":
+            s["pulang"] = t
+        elif s["masuk"] is None:
+            s["masuk"], s["status"] = t, status
 
     def _ingest(self, r):
         if len(r) < 3 or r[0] == "tanggal":
@@ -443,8 +457,9 @@ class AttendanceLogger:
             t = datetime.strptime(f"{r[0]} {r[1]}", "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return
-        if r[2] not in self.last or t > self.last[r[2]]:
-            self.last[r[2]] = t
+        tipe = r[5] if len(r) > 5 and r[5] else "masuk"
+        status = r[6] if len(r) > 6 and r[6] else ("terlambat" if r[1] > JAM_TERLAMBAT else "hadir")
+        self._apply(r[2], t, tipe, status)
 
     def sync(self):
         """Baca baris baru yang ditulis proses lain."""
@@ -452,13 +467,13 @@ class AttendanceLogger:
             try:
                 size = os.stat(self.path).st_size
             except OSError:
-                self.last.clear()
+                self.state.clear()
                 self._pos = 0
                 return
             if size == self._pos:
                 return
             if size < self._pos:  # file diganti/dipotong: baca ulang dari awal
-                self.last.clear()
+                self.state.clear()
                 self._pos = 0
             with open(self.path, "rb") as f:
                 f.seek(self._pos)
@@ -470,37 +485,44 @@ class AttendanceLogger:
             for r in csv.reader(data[:end + 1].decode("utf-8", "replace").splitlines()):
                 self._ingest(r)
 
-    def should_log(self, name, now):
-        last = self.last.get(name)
-        if last is None:
-            return True
-        if COOLDOWN_MODE == "daily":
-            return last.date() != now.date()
-        return (now - last).total_seconds() >= COOLDOWN_MENIT * 60
+    def decide(self, name, now):
+        """Tentukan catatan baru: ("masuk", "hadir"/"terlambat"), ("pulang", "pulang"), atau None."""
+        s = self.state.get(name)
+        if s is not None and s["tgl"] != now.date():
+            s = None                                   # hari baru = reset otomatis
+        jam = now.strftime("%H:%M:%S")
+        if s is None or s["masuk"] is None:
+            return "masuk", ("terlambat" if jam > JAM_TERLAMBAT else "hadir")
+        if (s["pulang"] is None and jam >= JAM_PULANG
+                and (now - s["masuk"]).total_seconds() >= MIN_DURASI_MENIT * 60):
+            return "pulang", "pulang"
+        return None
 
-    def log(self, name, pid, score, now):
+    def log(self, name, pid, score, now, tipe, status):
         with self._lock:
             new = not os.path.exists(self.path)
             with open(self.path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if new:
                     w.writerow(self.HEADER)
-                w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid, f"{score:.3f}"])
-            self.last[name] = now
+                w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid,
+                            f"{score:.3f}", tipe, status])
+            self._apply(name, now, tipe, status)
 
     def try_log(self, name, pid, score, now):
-        """Sinkron -> cek cooldown -> tulis, satu langkah. True bila absen baru tercatat."""
+        """Sinkron -> putuskan -> tulis, satu langkah. Kembalikan (tipe, status) bila tercatat, selain itu None."""
         with self._lock:
             self.sync()
-            if not self.should_log(name, now):
-                return False
-            self.log(name, pid, score, now)
-            return True
+            d = self.decide(name, now)
+            if d is None:
+                return None
+            self.log(name, pid, score, now, *d)
+            return d
 
     def count_today(self):
         today = datetime.now().date()
         with self._lock:
-            return sum(1 for t in self.last.values() if t.date() == today)
+            return sum(1 for s in self.state.values() if s["tgl"] == today and s["masuk"])
 
 
 # ----------------------------- Pelacak wajah -----------------------------
@@ -599,15 +621,15 @@ class Tracker:
 
 # ----------------------------- Logika pengenalan -----------------------------
 def _recheck_delay():
-    """Jeda verifikasi ulang untuk wajah yang sudah dikenali (juga mengikuti cooldown)."""
-    d = RECHECK_DETIK if RECHECK_DETIK > 0 else float("inf")
-    return min(d, COOLDOWN_MENIT * 60) if COOLDOWN_MODE == "interval" else d
+    """Jeda verifikasi ulang untuk wajah yang sudah dikenali (menentukan seberapa cepat absen pulang
+    terdeteksi bagi orang yang tetap berdiri di depan kamera)."""
+    return RECHECK_DETIK if RECHECK_DETIK > 0 else float("inf")
 
 
 def apply_match(t, name, pid, score, now_t, logger, recheck):
     """Perbarui status track dari hasil pencocokan; catat absen bila sudah terkonfirmasi.
 
-    Mengembalikan datetime bila absen baru tercatat, selain itu None."""
+    Mengembalikan (datetime, tipe, status) bila ada catatan baru (masuk/pulang), selain itu None."""
     t.score = score
     if name is None or score < MATCH_THRESH:
         if t.name is not None:
@@ -631,9 +653,10 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
     t.name, t.pid = name, pid
     t.next_embed = now_t + recheck
     dt = datetime.now()
-    if logger.try_log(name, pid, score, dt):
-        print(f"[ABSEN] {dt:%Y-%m-%d %H:%M:%S}  {name}  (skor {score:.2f})")
-        return dt
+    r = logger.try_log(name, pid, score, dt)
+    if r:
+        print(f"[{r[0].upper()}] {dt:%Y-%m-%d %H:%M:%S}  {name}  {r[1]}  (skor {score:.2f})")
+        return dt, r[0], r[1]
     return None
 
 
@@ -733,6 +756,7 @@ def run_absen(cam_index, headless=False):
     recheck = _recheck_delay()
     cam = Camera(cam_index)
     print(f"Mode absen aktif ({len(db.people())} orang terdaftar). "
+          f"Terlambat setelah {JAM_TERLAMBAT[:5]}, absen pulang mulai {JAM_PULANG[:5]}. "
           + ("Tekan Ctrl+C untuk berhenti." if headless else "Tekan Q / ESC untuk keluar."))
 
     small, gbuf, gi, have_prev = None, None, 0, False
@@ -777,10 +801,11 @@ def run_absen(cam_index, headless=False):
                 far = [f for f in faces if MIN_FACE_PX * 0.5 <= f[2] * scale[0] < MIN_FACE_PX]
                 for t in tracker.update(near):
                     if now_t >= t.next_embed:        # embedding hanya jika perlu
-                        dt = apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
-                                         now_t, logger, recheck)
-                        if dt:
-                            toast, toast_t = f"Tercatat: {t.name} {dt:%H:%M:%S}", now_t
+                        res = apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
+                                          now_t, logger, recheck)
+                        if res:
+                            dt, tipe, st = res
+                            toast, toast_t = f"{tipe.capitalize()} ({st}): {t.name} {dt:%H:%M:%S}", now_t
 
             t_now = time.perf_counter()
             inst = 1.0 / max(t_now - t_prev, 1e-6)
@@ -845,15 +870,20 @@ def export_rekap(dari, sampai, fmt):
                 continue
             tgl, jam, nama = r[0], r[1], r[2]
             pid = r[3] if len(r) > 3 else ""
+            tipe = r[5] if len(r) > 5 and r[5] else "masuk"
+            status = r[6] if len(r) > 6 and r[6] else ("terlambat" if jam > JAM_TERLAMBAT else "hadir")
             if (dari and tgl < dari) or (sampai and tgl > sampai):
                 continue
-            g = grp.setdefault((tgl, nama), [jam, jam, 0, pid])
-            g[0], g[1], g[2] = min(g[0], jam), max(g[1], jam), g[2] + 1
-            g[3] = pid or g[3]
+            g = grp.setdefault((tgl, nama), {"id": pid, "masuk": "", "status": "", "pulang": ""})
+            g["id"] = pid or g["id"]
+            if tipe == "pulang":
+                g["pulang"] = max(g["pulang"], jam)
+            elif not g["masuk"] or jam < g["masuk"]:
+                g["masuk"], g["status"] = jam, status
     if not grp:
         raise RuntimeError("Tidak ada data absensi pada rentang tanggal tersebut.")
-    rows = [[t, n, g[3], g[0], g[1], g[2]] for (t, n), g in sorted(grp.items())]
-    header = ["tanggal", "nama", "id", "jam_pertama", "jam_terakhir", "jumlah_catatan"]
+    rows = [[t, n, g["id"], g["masuk"], g["status"], g["pulang"]] for (t, n), g in sorted(grp.items())]
+    header = ["tanggal", "nama", "id", "jam_masuk", "status", "jam_pulang"]
     os.makedirs(EXPORT_DIR, exist_ok=True)
     path = os.path.join(EXPORT_DIR, f"rekap_{rows[0][0]}_{rows[-1][0]}.{fmt}")
     if fmt == "xlsx":
@@ -867,7 +897,7 @@ def export_rekap(dari, sampai, fmt):
         ws.append(header)
         for r in rows:
             ws.append(r)
-        for col, width in zip("ABCDEF", (12, 26, 14, 13, 13, 16)):
+        for col, width in zip("ABCDEF", (12, 26, 14, 13, 13, 13)):
             ws.column_dimensions[col].width = width
         ws.freeze_panes = "A2"
         wb.save(path)
