@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Auto Fast Face Recognition System - Absensi Sederhana (versi optimal)
+Auto Fast Face Recognition System - Absensi Sederhana (versi optimal + RTSP always-on)
 Berjalan penuh di CPU (0 VRAM) dan hemat RAM. Model: YuNet (deteksi) + SFace (embedding).
 
 Perintah:
   python main.py register --nama "Budi" --id 2023001   # daftarkan wajah (5-10 sampel)
   python main.py run [--jarak dekat|sedang|jauh]       # mode absen otomatis (Q / ESC = keluar)
+  python main.py run --rtsp "rtsp://user:pass@ip:554/stream" --headless   # CCTV selalu aktif
   python main.py export --format xlsx                  # ekspor rekap ke CSV atau Excel
   python main.py list                                  # daftar orang terdaftar
   python main.py delete --nama "Budi"                  # hapus data satu orang
@@ -19,6 +20,9 @@ Aturan absensi (atur di bagian KONFIGURASI):
     lewat MIN_DURASI_MENIT sejak masuk                  -> PULANG (sekali per hari).
   * Semua status di-reset otomatis setiap hari (dibandingkan per tanggal, tanpa restart).
 
+RTSP (CCTV): koneksi yang putus disambung ulang otomatis (backoff), program tidak berhenti.
+URL RTSP juga bisa diberikan lewat environment variable RTSP_URL.
+
 Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
   (baris lama 5 kolom tetap terbaca: dianggap tipe "masuk", status dihitung dari jamnya).
 """
@@ -26,11 +30,15 @@ import argparse
 import csv
 import gc
 import os
+import re
 import sys
 import threading
 import time
 import urllib.request
 from datetime import datetime
+
+# Opsi FFmpeg untuk RTSP: TCP (stabil) + tanpa buffer. Harus diset sebelum VideoCapture pertama.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay")
 
 import cv2
 import numpy as np
@@ -66,11 +74,14 @@ MODEL_MIN_BYTES = {YUNET_FILE: 100_000, SFACE_FILE: 10_000_000}  # deteksi file 
 CAM_INDEX = 0
 CAM_FPS = 30
 CAM_MJPG = True            # MJPG meringankan USB dan menaikkan FPS pada banyak webcam
+RTSP_RECONNECT_MIN = 1.0   # detik jeda sambung ulang pertama (CCTV putus)
+RTSP_RECONNECT_MAX = 15.0  # jeda maksimum (backoff x2)
 
 # Profil jarak (pilih lewat --jarak). Jarak pengenalan ditentukan oleh jumlah piksel wajah:
 # wajah butuh >= ~50 px lebar (di frame kamera asli) agar dikenali andal. Untuk webcam 720p
 # umum, lebar wajah (px) ~ 177 / jarak (m); untuk 480p kira-kira separuhnya.
 # Format: (lebar kamera, tinggi kamera, lebar frame deteksi, lebar wajah minimum px, skor deteksi)
+# Catatan: lebar/tinggi kamera hanya dipakai untuk kamera lokal; RTSP memakai resolusi stream.
 PROFIL = {
     "dekat":  (640, 480, 320, 80, 0.85),    # paling ringan, +-1 m
     "sedang": (1280, 720, 480, 50, 0.80),   # +-3 m
@@ -176,54 +187,126 @@ def _cam_backend():
     return cv2.CAP_ANY
 
 
-class Camera:
-    """Baca kamera di thread terpisah dan hanya simpan frame terbaru (tanpa lag buffer)."""
+def is_rtsp(src):
+    """True bila sumber berupa URL (rtsp://, http://, dst), False untuk index kamera lokal."""
+    return isinstance(src, str) and "://" in src
 
-    def __init__(self, index=CAM_INDEX):
-        backend = _cam_backend()
-        self.cap = cv2.VideoCapture(index, backend)
-        if not self.cap.isOpened() and backend != cv2.CAP_ANY:   # cadangan: biarkan OpenCV memilih
-            self.cap.release()
-            self.cap = cv2.VideoCapture(index)
-        if not self.cap.isOpened():
-            self.cap.release()
-            raise CameraError(f"Kamera index {index} tidak terdeteksi. Periksa sambungan/izin kamera "
-                              "atau ubah CAM_INDEX (opsi --kamera).")
-        if CAM_MJPG:
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+def mask_url(src):
+    """Sembunyikan password saat URL dicetak ke log."""
+    return re.sub(r"//([^:@/]+):[^@/]*@", r"//\1:***@", str(src))
+
+
+class Camera:
+    """Baca kamera di thread terpisah dan hanya simpan frame terbaru (tanpa lag buffer).
+
+    source: index kamera lokal (int) atau URL RTSP (str). Untuk RTSP, koneksi yang putus
+    disambung ulang otomatis (backoff) tanpa menghentikan program.
+    """
+
+    def __init__(self, source=CAM_INDEX, reconnect=None):
+        self.source = source
+        self.rtsp = is_rtsp(source)
+        self.reconnect = self.rtsp if reconnect is None else reconnect
+        self.cap = None
         self.failed = False
+        self.connected = False
+        self._lost = False
         self._frame = None
         self._new = threading.Event()
         self._stop = threading.Event()
+        if not self.rtsp:   # kamera lokal: gagal buka = langsung error
+            self.cap = self._open()
+            if not self.cap.isOpened():
+                self.cap.release()
+                raise CameraError(f"Kamera index {source} tidak terdeteksi. Periksa sambungan/izin kamera "
+                                  "atau ubah CAM_INDEX (opsi --kamera).")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        first = self.read(timeout=3.0)
+        first = self.read(timeout=10.0 if self.rtsp else 3.0)
         if first is None:
+            if self.rtsp and self.reconnect:   # CCTV belum siap: tetap jalan, coba terus di latar belakang
+                print(f"RTSP {mask_url(source)} belum tersambung, mencoba terus di latar belakang...")
+                return
             self.close()
             raise CameraError("Kamera terbuka tetapi tidak mengirim gambar (dipakai aplikasi lain?).")
         h, w = first.shape[:2]
-        print(f"Kamera aktif: {w}x{h}" + (f" (diminta {CAM_WIDTH}x{CAM_HEIGHT}; webcam tidak mendukung, "
-                                           "jarak pengenalan jadi lebih pendek)" if w < CAM_WIDTH else ""))
+        if self.rtsp:
+            print(f"RTSP aktif: {mask_url(source)} ({w}x{h})")
+        else:
+            print(f"Kamera aktif: {w}x{h}" + (f" (diminta {CAM_WIDTH}x{CAM_HEIGHT}; webcam tidak mendukung, "
+                                               "jarak pengenalan jadi lebih pendek)" if w < CAM_WIDTH else ""))
+
+    def _open(self):
+        if self.rtsp:
+            try:   # OpenCV >= 4.5.2: timeout agar read tidak menggantung saat jaringan putus
+                return cv2.VideoCapture(self.source, cv2.CAP_FFMPEG,
+                                        [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000,
+                                         cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000])
+            except TypeError:
+                return cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        backend = _cam_backend()
+        cap = cv2.VideoCapture(self.source, backend)
+        if not cap.isOpened() and backend != cv2.CAP_ANY:   # cadangan: biarkan OpenCV memilih
+            cap.release()
+            cap = cv2.VideoCapture(self.source)
+        if cap.isOpened():
+            if CAM_MJPG:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _drop(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        if self.connected:
+            print("Kamera terputus" + (", mencoba menyambung ulang..." if self.reconnect else "."))
+            self._lost = True
+        self.connected = False
 
     def _loop(self):
-        fails = 0
-        while not self._stop.is_set():
-            ok, frame = self.cap.read()
-            if not ok:
-                fails += 1
-                if fails > 50:
-                    self.failed = True
+        fails, delay = 0, RTSP_RECONNECT_MIN
+        try:
+            while not self._stop.is_set():
+                if self.cap is None:
+                    self.cap = self._open()
+                    if not self.cap.isOpened():
+                        self._drop()
+                        if not self.reconnect:
+                            self.failed = True
+                            self._new.set()
+                            return
+                        self._stop.wait(delay)
+                        delay = min(delay * 2, RTSP_RECONNECT_MAX)
+                        continue
+                ok, frame = self.cap.read()
+                if ok and frame is not None:
+                    fails, delay = 0, RTSP_RECONNECT_MIN
+                    if not self.connected and self._lost:
+                        print("Kamera tersambung kembali.")
+                        self._lost = False
+                    self.connected = True
+                    self._frame = frame
                     self._new.set()
-                    return
-                time.sleep(0.02)
-                continue
-            fails = 0
-            self._frame = frame
-            self._new.set()
+                    continue
+                fails += 1
+                if fails > (3 if self.rtsp else 50):
+                    fails = 0
+                    self._drop()
+                    if not self.reconnect:
+                        self.failed = True
+                        self._new.set()
+                        return
+                    self._stop.wait(delay)
+                    delay = min(delay * 2, RTSP_RECONNECT_MAX)
+                else:
+                    time.sleep(0.02)
+        finally:
+            self._drop()
 
     def read(self, timeout=1.0):
         """Kembalikan frame terbaru yang belum dibaca, atau None jika belum ada."""
@@ -234,12 +317,11 @@ class Camera:
 
     def close(self):
         self._stop.set()
-        self._thread.join(timeout=1.0)
-        self.cap.release()
+        self._thread.join(timeout=3.0)   # thread sendiri yang melepas kamera (finally di _loop)
 
 
 def next_frame(cam):
-    """Ambil frame berikutnya; lempar error bila kamera terputus."""
+    """Ambil frame berikutnya; lempar error bila kamera lokal terputus (RTSP: sambung ulang otomatis)."""
     frame = cam.read()
     if frame is None and cam.failed:
         raise CameraError("Kamera terputus.")
@@ -745,7 +827,8 @@ def register(name, pid, n_samples, cam_index):
 
 
 # ----------------------------- Mode absen -----------------------------
-def run_absen(cam_index, headless=False):
+def run_absen(source, headless=False):
+    """source: index kamera lokal (int) atau URL RTSP (str)."""
     cv2.setNumThreads(CV_THREADS)
     db = Database()
     if db.is_empty():
@@ -754,7 +837,7 @@ def run_absen(cam_index, headless=False):
     engine = FaceEngine(*ensure_models())
     logger, tracker = AttendanceLogger(), Tracker()
     recheck = _recheck_delay()
-    cam = Camera(cam_index)
+    cam = Camera(source)
     print(f"Mode absen aktif ({len(db.people())} orang terdaftar). "
           f"Terlambat setelah {JAM_TERLAMBAT[:5]}, absen pulang mulai {JAM_PULANG[:5]}. "
           + ("Tekan Ctrl+C untuk berhenti." if headless else "Tekan Q / ESC untuk keluar."))
@@ -764,11 +847,23 @@ def run_absen(cam_index, headless=False):
     frame_no, fps, t_prev = 0, 0.0, time.perf_counter()
     ram_mb, ram_t, toast, toast_t = None, 0.0, "", 0.0
     db_t = 0.0  # waktu terakhir mengecek perubahan database / log
+    was_connected = True
     try:
         while True:
             frame = next_frame(cam)
             if frame is None:
+                if was_connected and not cam.connected:   # RTSP putus: buang pelacak lama
+                    was_connected = False
+                    tracker.tracks.clear()
+                    have_prev = False
+                if not headless and not cam.connected:    # tetap tampilkan jendela + tangani tombol keluar
+                    wait = np.zeros((240, 640, 3), np.uint8)
+                    put_text(wait, "Kamera terputus, menyambung ulang...", (10, 120), (0, 165, 255), 0.7)
+                    cv2.imshow(WIN_RUN, wait)
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                        break
                 continue
+            was_connected = True
             frame_no += 1
             sw, sh, scale = small_size(frame)
             if small is None or small.shape[:2] != (sh, sw):  # alokasi buffer sekali, dipakai ulang
@@ -924,6 +1019,8 @@ def main():
 
     p = sub.add_parser("run", help="mode absen otomatis")
     p.add_argument("--kamera", type=int, default=CAM_INDEX)
+    p.add_argument("--rtsp", default=os.environ.get("RTSP_URL", ""),
+                   help="URL RTSP CCTV (selalu aktif, sambung ulang otomatis); mengalahkan --kamera")
     p.add_argument("--jarak", choices=list(PROFIL), default=PROFIL_AKTIF,
                    help="profil jarak: dekat (640x480, ringan), sedang (720p), jauh (720p, lebih sensitif)")
     p.add_argument("--headless", action="store_true", help="tanpa jendela (paling hemat resource)")
@@ -945,7 +1042,7 @@ def main():
         if a.cmd == "register":
             register(a.nama.strip(), a.id.strip(), a.jumlah, a.kamera)
         elif a.cmd == "run":
-            run_absen(a.kamera, a.headless)
+            run_absen(a.rtsp.strip() or a.kamera, a.headless)
         elif a.cmd == "export":
             export_rekap(a.dari, a.sampai, a.format)
         elif a.cmd == "list":

@@ -8,22 +8,29 @@ Membaca/menulis absensi.csv dan faces_db.npz milik main.py (letakkan di folder y
 Aturan absensi (sama dengan main.py): masuk setelah JAM_TERLAMBAT = terlambat; scan setelah JAM_PULANG
 dari orang yang sudah masuk = absen pulang; semua status di-reset otomatis tiap hari.
 
-Kamera absen punya dua sumber:
-  * Kamera server  : server membaca kamera komputer ini langsung lewat OpenCV dan memakai alur yang
-                     sama dengan 'main.py run' (deteksi tiap 3 frame + optical flow). Paling cepat.
+Kamera absen punya tiga sumber:
+  * CCTV RTSP      : (opsi --rtsp) worker ALWAYS-ON di server. Absen berjalan terus sejak dashboard hidup,
+                     walau tidak ada browser yang terbuka, dan sambung ulang otomatis bila CCTV putus.
+                     Browser hanya "menonton" (gambar di-encode hanya saat ada penonton).
+  * Kamera server  : (tanpa --rtsp) server membaca kamera komputer ini lewat OpenCV, on-demand.
                      Tidak bisa dipakai bersamaan dengan 'main.py run' (rebutan kamera).
-  * Kamera browser : kamera perangkat yang membuka halaman (HP/PC lain). Browser hanya mengizinkan kamera
-                     di localhost atau HTTPS.
+  * Kamera browser : kamera perangkat yang membuka halaman (HP/PC lain), on-demand. Browser hanya
+                     mengizinkan kamera di localhost atau HTTPS.
 
 Jalankan : python dashboard.py
+           python dashboard.py --rtsp "rtsp://user:pass@192.168.1.64:554/Streaming/Channels/102" --jarak jauh
 Buka     : http://127.0.0.1:8000  (otomatis terbuka di browser)
 Opsi     : --port 8000
            --host 0.0.0.0   (agar bisa dibuka dari HP/PC lain di jaringan yang sama)
            --no-browser     (jangan buka browser otomatis)
            --pin 1234       (wajib jika dibuka dari jaringan; melindungi kamera absen, pengelolaan
                              wajah, DAN pembacaan data absensi)
+           --rtsp URL       (CCTV always-on; bisa juga lewat environment variable RTSP_URL)
+           --jarak dekat|sedang|jauh   (profil jarak main.py; CCTV umumnya: jauh)
 
 PIN dikirim apa adanya lewat HTTP biasa; di jaringan yang tidak tepercaya pakai HTTPS.
+CCTV always-on tetap berjalan walau --host bukan localhost dan tanpa --pin (hanya tampilannya
+di browser yang dinonaktifkan).
 """
 import argparse
 import base64
@@ -162,6 +169,8 @@ INIT_LOCK = threading.RLock()
 SCAN_DETECT_W = 640        # lebar frame untuk deteksi (embedding tetap dari frame penuh)
 SCAN_MIN_FACE_PX = 48      # lebar wajah minimum (px, pada frame kiriman browser, maks 1280)
 SCAN_SESSION_TTL = 30.0    # detik: sesi kamera tanpa frame baru dibuang
+RTSP_URL = ""              # diisi dari --rtsp / env RTSP_URL (CCTV selalu aktif)
+JARAK = None               # profil jarak main.py (dekat|sedang|jauh), None = bawaan
 _core = {}
 _sessions = {}
 
@@ -172,6 +181,11 @@ class ApiError(Exception):
         self.code, self.msg, self.rejected = code, msg, rejected or []
 
 
+def mask_url(src):
+    """Sembunyikan password saat URL dicetak ke log."""
+    return re.sub(r"//([^:@/]+):[^@/]*@", r"//\1:***@", str(src))
+
+
 def get_main():
     """Muat main.py (OpenCV) sekali saja, hanya saat pertama kali dibutuhkan."""
     with INIT_LOCK:
@@ -180,6 +194,8 @@ def get_main():
             sys.path.insert(0, BASE)
             import main
             main.cv2.setNumThreads(main.CV_THREADS)
+            if JARAK:
+                main.apply_profile(JARAK)
             _core["main"] = main
         return _core["main"]
 
@@ -426,18 +442,61 @@ def api_scan(raw, cam):
     return {"faces": faces_out, "events": events, "db_empty": db_empty}
 
 
-# ----------------------------- Kamera absen: kamera server (seperti main.py) -----------------------------
+# ----------------------------- Kamera absen: kamera server / CCTV RTSP -----------------------------
 class ServerScanner:
-    """Baca kamera langsung di server dan jalankan alur yang sama dengan main.py run."""
-    IDLE_STOP = 30.0   # detik tanpa permintaan frame dari browser -> kamera dilepas
+    """Worker kamera di server (alur sama dengan main.py run).
+
+    * Mode CCTV (always=True): jalan terus sejak dashboard hidup, sambung ulang otomatis.
+      Browser hanya 'menonton'; gambar baru di-encode saat ada penonton.
+    * Mode on-demand (kamera lokal): hidup saat dibuka, mati bila tidak ada penonton IDLE_STOP detik.
+    """
+    IDLE_STOP = 30.0   # on-demand: detik tanpa penonton -> kamera dilepas
+    VIEW_TTL = 5.0     # CCTV: ada penonton bila ada permintaan frame dalam N detik terakhir
 
     def __init__(self):
         self.lock = threading.Lock()
         self.stop_ev = threading.Event()
-        self.running, self.jpeg, self.err = False, None, ""
+        self.running, self.connected, self.always = False, False, False
+        self.jpeg, self.err, self.source = None, "", 0
         self.fps, self.events, self.last_req = 0.0, [], 0.0
         self.th = None
 
+    # ---- mode CCTV: selalu aktif ----
+    def start_always(self, source):
+        with self.lock:
+            if self.running:
+                return
+            self.always, self.source = True, source
+            self.stop_ev.clear()
+            self.err, self.jpeg, self.events = "", None, []
+            self.running = True
+            self.th = threading.Thread(target=self._supervisor, daemon=True)
+            self.th.start()
+
+    def _supervisor(self):
+        delay = 2.0
+        while not self.stop_ev.is_set():
+            t0 = time.time()
+            cam = None
+            try:
+                main, engine = get_main(), get_engine()
+                cam = main.Camera(self.source, reconnect=True)   # RTSP: tidak error walau CCTV belum nyala
+                self.err = ""
+                self._loop(main, engine, cam)
+            except Exception as e:
+                self.err = str(e)
+                print(f"[CCTV] error: {e}")
+            finally:
+                if cam is not None:
+                    cam.close()
+                self.connected, self.jpeg = False, None
+            if self.stop_ev.wait(delay):
+                break
+            delay = 2.0 if time.time() - t0 > 60 else min(delay * 2, 30.0)
+        with self.lock:
+            self.running = False
+
+    # ---- mode on-demand: kamera lokal ----
     def start(self, cam_index):
         with self.lock:
             if self.running:
@@ -445,116 +504,135 @@ class ServerScanner:
                 return
             main, engine = get_main(), get_engine()
             cam = main.Camera(cam_index)          # lempar CameraError bila gagal
+            self.always = False
             self.stop_ev.clear()
             self.err, self.jpeg, self.events = "", None, []
             self.last_req, self.running = time.time(), True
-            self.th = threading.Thread(target=self._loop, args=(main, engine, cam), daemon=True)
+            self.th = threading.Thread(target=self._run_once, args=(main, engine, cam), daemon=True)
             self.th.start()
 
-    def stop(self):
-        self.stop_ev.set()
-        th = self.th
-        if th:
-            th.join(timeout=3.0)
-
-    def status(self):
-        with self.lock:
-            ev, self.events = self.events, []
-            return {"running": self.running, "fps": round(self.fps), "err": self.err, "events": ev}
-
-    def _loop(self, main, engine, cam):
-        np, cv2 = main.np, main.cv2
+    def _run_once(self, main, engine, cam):
         try:
-            db, logger, tracker = main.Database(DB_FILE), get_logger(main), main.Tracker()
-            recheck = main._recheck_delay()
-            small = gbuf = None
-            gi, have_prev, far = 0, False, []
-            n, fps, t_prev, db_t = 0, 0.0, time.perf_counter(), 0.0
-            while not self.stop_ev.is_set():
-                now_t = time.time()
-                if now_t - self.last_req > self.IDLE_STOP:
-                    break
-                frame = main.next_frame(cam)
-                if frame is None:
-                    continue
-                n += 1
-                sw, sh, scale = main.small_size(frame)
-                if small is None or small.shape[:2] != (sh, sw):
-                    small = np.empty((sh, sw, 3), np.uint8)
-                    gbuf = [np.empty((sh, sw), np.uint8), np.empty((sh, sw), np.uint8)]
-                    have_prev = False
-                    tracker.tracks.clear()
-                cv2.resize(frame, (sw, sh), dst=small, interpolation=cv2.INTER_AREA)
-                gray, prev = gbuf[gi], gbuf[1 - gi]
-                cv2.cvtColor(small, cv2.COLOR_BGR2GRAY, dst=gray)
-                if have_prev:
-                    tracker.advance(prev, gray)
-                gi, have_prev = 1 - gi, True
-
-                if now_t - db_t > 2.0:                       # sinkron log dan muat ulang database
-                    db_t = now_t
-                    logger.sync()
-                    if db.changed():
-                        try:
-                            db.reload()
-                        except RuntimeError:
-                            pass
-                        for t in tracker.tracks.values():
-                            t.next_embed = 0.0
-                if n % main.DETECT_EVERY == 0:
-                    with ENGINE_LOCK:
-                        faces = engine.detect(small)
-                        near = [f for f in faces if f[2] * scale[0] >= main.MIN_FACE_PX]
-                        far = [f for f in faces
-                               if main.MIN_FACE_PX * 0.5 <= f[2] * scale[0] < main.MIN_FACE_PX]
-                        for t in tracker.update(near):
-                            if now_t >= t.next_embed:
-                                res = main.apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
-                                                       now_t, logger, recheck)
-                                if res:
-                                    dt, tipe, st = res
-                                    with self.lock:
-                                        self.events = (self.events + [{
-                                            "nama": t.name, "tipe": tipe, "status": st,
-                                            "jam": dt.strftime("%H:%M:%S")}])[-20:]
-
-                # gambar kotak langsung di frame (sama seperti main.py)
-                k = np.array([*scale, *scale], np.float32)
-                for f in far:
-                    x, y, bw, bh = (int(v) for v in f[:4] * k)
-                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
-                    main.put_text(frame, "Terlalu jauh", (x, max(y - 6, 14)), (210, 210, 210), 0.5)
-                for t in tracker.tracks.values():
-                    if t.missed > 1:
-                        continue
-                    x, y, bw, bh = (int(v) for v in t.box * k)
-                    if t.name:
-                        color, label = (0, 200, 0), f"{t.name} {t.score:.2f}"
-                    elif t.cand:
-                        color, label = (0, 200, 255), f"{t.cand}? {t.score:.2f}"
-                    else:
-                        color, label = (0, 0, 255), f"Unknown {t.score:.2f}"
-                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-                    main.put_text(frame, label, (x, max(y - 6, 14)), color)
-                t_now = time.perf_counter()
-                inst = 1.0 / max(t_now - t_prev, 1e-6)
-                fps, t_prev = (inst if fps == 0 else 0.9 * fps + 0.1 * inst), t_now
-                self.fps = fps
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                if ok:
-                    self.jpeg = buf.tobytes()
+            self._loop(main, engine, cam)
         except Exception as e:
             self.err = str(e)
         finally:
             cam.close()
             with self.lock:
-                self.running, self.jpeg = False, None
+                self.running, self.connected, self.jpeg = False, False, None
+
+    def stop(self):
+        self.stop_ev.set()
+        th = self.th
+        if th:
+            th.join(timeout=5.0)
+
+    def status(self):
+        with self.lock:
+            ev, self.events = self.events, []
+            return {"running": self.running, "connected": self.connected, "always": self.always,
+                    "fps": round(self.fps), "err": self.err, "events": ev}
+
+    def _loop(self, main, engine, cam):
+        np, cv2 = main.np, main.cv2
+        db, logger, tracker = main.Database(DB_FILE), get_logger(main), main.Tracker()
+        recheck = main._recheck_delay()
+        small = gbuf = None
+        gi, have_prev, far = 0, False, []
+        n, fps, t_prev, db_t = 0, 0.0, time.perf_counter(), 0.0
+        while not self.stop_ev.is_set():
+            now_t = time.time()
+            if not self.always and now_t - self.last_req > self.IDLE_STOP:
+                break
+            frame = main.next_frame(cam)
+            if frame is None:
+                if not cam.connected:             # CCTV putus: buang gambar dan pelacak lama
+                    self.connected, self.jpeg = False, None
+                    if tracker.tracks:
+                        tracker.tracks.clear()
+                        have_prev = False
+                continue
+            self.connected = True
+            n += 1
+            sw, sh, scale = main.small_size(frame)
+            if small is None or small.shape[:2] != (sh, sw):
+                small = np.empty((sh, sw, 3), np.uint8)
+                gbuf = [np.empty((sh, sw), np.uint8), np.empty((sh, sw), np.uint8)]
+                have_prev = False
+                tracker.tracks.clear()
+            cv2.resize(frame, (sw, sh), dst=small, interpolation=cv2.INTER_AREA)
+            gray, prev = gbuf[gi], gbuf[1 - gi]
+            cv2.cvtColor(small, cv2.COLOR_BGR2GRAY, dst=gray)
+            if have_prev:
+                tracker.advance(prev, gray)
+            gi, have_prev = 1 - gi, True
+
+            if now_t - db_t > 2.0:                       # sinkron log dan muat ulang database
+                db_t = now_t
+                logger.sync()
+                if db.changed():
+                    try:
+                        db.reload()
+                    except RuntimeError:
+                        pass
+                    for t in tracker.tracks.values():
+                        t.next_embed = 0.0
+            if n % main.DETECT_EVERY == 0:
+                with ENGINE_LOCK:
+                    faces = engine.detect(small)
+                    near = [f for f in faces if f[2] * scale[0] >= main.MIN_FACE_PX]
+                    far = [f for f in faces
+                           if main.MIN_FACE_PX * 0.5 <= f[2] * scale[0] < main.MIN_FACE_PX]
+                    for t in tracker.update(near):
+                        if now_t >= t.next_embed:
+                            res = main.apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
+                                                   now_t, logger, recheck)
+                            if res:
+                                dt, tipe, st = res
+                                with self.lock:
+                                    self.events = (self.events + [{
+                                        "nama": t.name, "tipe": tipe, "status": st,
+                                        "jam": dt.strftime("%H:%M:%S")}])[-20:]
+
+            t_now = time.perf_counter()
+            inst = 1.0 / max(t_now - t_prev, 1e-6)
+            fps, t_prev = (inst if fps == 0 else 0.9 * fps + 0.1 * inst), t_now
+            self.fps = fps
+
+            if self.always and now_t - self.last_req > self.VIEW_TTL:
+                self.jpeg = None                          # tidak ada penonton: lewati gambar + encode JPEG
+                continue
+
+            # gambar kotak langsung di frame (sama seperti main.py)
+            k = np.array([*scale, *scale], np.float32)
+            for f in far:
+                x, y, bw, bh = (int(v) for v in f[:4] * k)
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
+                main.put_text(frame, "Terlalu jauh", (x, max(y - 6, 14)), (210, 210, 210), 0.5)
+            for t in tracker.tracks.values():
+                if t.missed > 1:
+                    continue
+                x, y, bw, bh = (int(v) for v in t.box * k)
+                if t.name:
+                    color, label = (0, 200, 0), f"{t.name} {t.score:.2f}"
+                elif t.cand:
+                    color, label = (0, 200, 255), f"{t.cand}? {t.score:.2f}"
+                else:
+                    color, label = (0, 0, 255), f"Unknown {t.score:.2f}"
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+                main.put_text(frame, label, (x, max(y - 6, 14)), color)
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                self.jpeg = buf.tobytes()
 
 
 scanner = ServerScanner()
 
 
 def api_cam_start(d):
+    if scanner.always:                    # CCTV sudah berjalan; ini hanya mulai menonton
+        scanner.last_req = time.time()
+        return {"message": "CCTV selalu aktif."}
     try:
         scanner.start(int(d.get("kamera") or 0))
     except Exception as e:
@@ -563,6 +641,8 @@ def api_cam_start(d):
 
 
 def api_cam_stop(d):
+    if scanner.always:                    # CCTV tidak pernah dimatikan dari UI
+        return {"message": "Tampilan ditutup. CCTV tetap berjalan di latar belakang."}
     scanner.stop()
     return {"message": "Kamera server dihentikan."}
 
@@ -848,7 +928,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
           <div class="stage" id="stage">
             <video id="c-video" playsinline muted></video>
             <canvas id="c-canvas"></canvas>
-            <div class="idle" id="c-idle"><div><span class="logo"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg></span>Kamera belum aktif<br><span class="mute">Tekan Mulai kamera untuk memulai absen otomatis</span></div></div>
+            <div class="idle" id="c-idle"><div><span class="logo"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg></span>Kamera belum aktif<br><span class="mute" id="c-idle-hint">Tekan Mulai kamera untuk memulai absen otomatis</span></div></div>
             <div class="pill" id="c-pill" hidden></div>
             <div class="toast" id="c-toast"></div>
           </div>
@@ -870,7 +950,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
             <li>Jarak ideal 0,5 sampai 3 meter dari kamera.</li>
             <li>Pastikan cahaya cukup dan wajah menghadap lurus.</li>
             <li>Kotak kuning berarti sedang memverifikasi, hijau berarti dikenali.</li>
-            <li>Kamera server memakai kamera komputer ini dan tidak bisa berjalan bersamaan dengan main.py run.</li>
+            <li id="c-tip-srv">Kamera server memakai kamera komputer ini dan tidak bisa berjalan bersamaan dengan main.py run.</li>
           </ul>
         </div>
       </div>
@@ -942,7 +1022,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const VIEWS = ['ringkasan', 'kamera', 'kelola', 'rekap'];
 const dateEl = $('date');
 dateEl.value = today();
-const INFO_DEFAULT = {people: [], editable: true, pin_required: false, min_samples: 3, max_images: 12};
+const INFO_DEFAULT = {people: [], editable: true, pin_required: false, min_samples: 3, max_images: 12, rtsp: false};
 let view = 'ringkasan', data = null, info = {...INFO_DEFAULT}, pendingAdd = false;
 
 const pinHeader = () => { const p = sessionStorage.getItem('pin'); return p ? {'X-Pin': p} : {}; };
@@ -989,6 +1069,7 @@ function route() {
   closeNav();
   if (view === 'kelola' || view === 'kamera') loadPeople();
   load();
+  if (view === 'kamera') autoWatch();
 }
 
 // ---------- data absensi ----------
@@ -1113,6 +1194,19 @@ function setPill(text, err) {
   p.hidden = !text; p.textContent = text || ''; p.className = 'pill' + (err ? ' err' : '');
 }
 
+// Mode CCTV: absen berjalan terus di server, halaman ini hanya menonton.
+function applyRtspUi() {
+  if (!info.rtsp) return;
+  $('c-src').options[0].textContent = 'CCTV RTSP (selalu aktif)';
+  $('c-tip-srv').textContent = 'CCTV berjalan terus di server walau halaman ini ditutup. Menutup tampilan tidak menghentikan absen.';
+  if (!srv.on && !cam.on) $('c-idle-hint').textContent = 'Tekan Mulai kamera untuk menonton CCTV (absen tetap berjalan di latar belakang)';
+}
+
+// Buka halaman Kamera absen -> langsung menonton CCTV (tanpa perlu menekan tombol).
+function autoWatch() {
+  if (info.rtsp && info.editable && !srv.on && !cam.on && $('c-src').value === 'server') srvStart();
+}
+
 async function listDevices() {
   try {
     const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
@@ -1218,14 +1312,14 @@ function showToast(e) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
-// --- sumber: kamera server (server membaca kamera, sama seperti main.py) ---
+// --- sumber: kamera server / CCTV RTSP (server membaca kamera, sama seperti main.py) ---
 async function srvStart() {
   if (!info.editable) { setPill('Kamera server nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
-  setPill('Membuka kamera server...');
+  setPill(info.rtsp ? 'Membuka tampilan CCTV...' : 'Membuka kamera server...');
   try { await api('POST', '/api/server-cam/start', {kamera: 0}); }
   catch (e) { setPill(e.message, true); return; }
   srv.on = true; const tok = ++srv.tok;
-  $('c-idle').hidden = true; $('c-toggle').textContent = 'Hentikan kamera';
+  $('c-idle').hidden = true; $('c-toggle').textContent = info.rtsp ? 'Tutup tampilan' : 'Hentikan kamera';
   setPill('Menunggu wajah...');
   srvLoop(tok);
 }
@@ -1235,7 +1329,7 @@ async function srvStop() {
   srv.on = false; srv.tok++;
   try { await api('POST', '/api/server-cam/stop', {}); } catch (e) { /* abaikan */ }
   const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
-  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera';
+  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera';
 }
 
 async function srvLoop(tok) {
@@ -1261,9 +1355,10 @@ async function srvLoop(tok) {
         if (j.events.length) { clearTimeout(reloadTimer); reloadTimer = setTimeout(load, 300); }
         if (!j.running) {
           srv.on = false; setPill(j.err || 'Kamera server berhenti.', true);
-          $('c-idle').hidden = false; $('c-toggle').textContent = 'Mulai kamera'; return;
+          $('c-idle').hidden = false; $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera'; return;
         }
-        setPill(`Kamera server aktif · ${j.fps} FPS`);
+        if (j.always && !j.connected) setPill('CCTV terputus, menyambung ulang...', true);
+        else setPill(`${j.always ? 'CCTV aktif' : 'Kamera server aktif'} · ${j.fps} FPS`);
       }
     } catch (e) {
       if (srv.tok !== tok) return;
@@ -1278,6 +1373,7 @@ $('c-toggle').onclick = () => {
   else if (srv.on) srvStop();
   else if ($('c-src').value === 'server') srvStart(); else camStart();
 };
+$('c-src').onchange = () => { if (cam.on) camStop(); if (srv.on) srvStop(); };
 $('c-dev').onchange = () => cam.on && camStart();
 $('c-full').onclick = () => { const s = $('stage'); document.fullscreenElement ? document.exitFullscreen() : s.requestFullscreen && s.requestFullscreen(); };
 
@@ -1416,7 +1512,10 @@ $('d-cam').onclick = startCam; $('d-snap').onclick = snap; $('d-auto').onclick =
 $('d-thumbs').onclick = e => { const b = e.target.closest('button[data-rm]'); if (b) { imgs.splice(+b.dataset.rm, 1); renderThumbs(); } };
 $('d-save').onclick = save; $('d-cancel').onclick = () => $('dlg').close();
 $('dlg').addEventListener('close', stopCam);
-fetch('/api/info', {cache: 'no-store'}).then(r => r.json()).then(j => { info = {...info, ...j}; $('pinbox').hidden = !j.pin_required; }).catch(() => {});
+fetch('/api/info', {cache: 'no-store'}).then(r => r.json()).then(j => {
+  info = {...info, ...j}; $('pinbox').hidden = !j.pin_required;
+  applyRtspUi(); if (view === 'kamera') autoWatch();
+}).catch(() => {});
 route();
 </script>
 </body>
@@ -1451,8 +1550,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8")
-        if u.path == "/api/info":      # publik: hanya status PIN dan mode edit
-            return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED}), JSON)
+        if u.path == "/api/info":      # publik: hanya status PIN, mode edit, dan apakah CCTV aktif
+            return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED,
+                                              "rtsp": scanner.always}), JSON)
         if u.path not in ("/api/people", "/api/data", "/export",
                           "/api/server-cam/frame", "/api/server-cam/status"):
             return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
@@ -1470,7 +1570,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self.send_bytes(200, jpg, "image/jpeg")
         if u.path == "/api/server-cam/status":
-            if scanner.running:
+            if scanner.running and not scanner.always:   # CCTV: hanya permintaan frame yang dihitung penonton
                 scanner.last_req = time.time()
             return self.send(200, json.dumps(scanner.status()), JSON)
         if u.path == "/api/people":
@@ -1555,22 +1655,29 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global PIN, EDIT_ENABLED
+    global PIN, EDIT_ENABLED, RTSP_URL, JARAK
     ap = argparse.ArgumentParser(description="Dashboard Admin Absensi Wajah")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--pin", default="", help="PIN admin untuk kamera absen, pengelolaan wajah, dan data absensi (wajib jika --host bukan localhost)")
+    ap.add_argument("--rtsp", default=os.environ.get("RTSP_URL", ""),
+                    help="URL RTSP CCTV: absen berjalan terus (always-on) sejak dashboard hidup")
+    ap.add_argument("--jarak", choices=["dekat", "sedang", "jauh"], default=None,
+                    help="profil jarak main.py (CCTV umumnya: jauh)")
     a = ap.parse_args()
-    PIN = a.pin
+    PIN, RTSP_URL, JARAK = a.pin, a.rtsp.strip(), a.jarak
     EDIT_ENABLED = a.host in ("127.0.0.1", "localhost", "::1") or bool(PIN)
     if not EDIT_ENABLED:
-        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah dinonaktifkan "
-              "(hanya baca). Data absensi bisa dibaca siapa pun di jaringan; pakai --pin untuk melindunginya.")
+        print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah "
+              "dinonaktifkan (hanya baca). Data absensi bisa dibaca siapa pun di jaringan; pakai --pin untuk melindunginya.")
 
     server = ThreadingHTTPServer((a.host, a.port), Handler)
     url = f"http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}"
     print(f"Dashboard berjalan di {url}  (Ctrl+C untuk berhenti)")
+    if RTSP_URL:
+        scanner.start_always(RTSP_URL)       # worker CCTV hidup terus, tidak bergantung pada browser
+        print("CCTV always-on: " + mask_url(RTSP_URL))
     if not a.no_browser:
         webbrowser.open(url)
     try:
