@@ -8,6 +8,15 @@ Membaca/menulis absensi.csv dan faces_db.npz milik main.py (letakkan di folder y
 Aturan absensi (sama dengan main.py): masuk setelah JAM_TERLAMBAT = terlambat; scan setelah JAM_PULANG
 dari orang yang sudah masuk = absen pulang; semua status di-reset otomatis tiap hari.
 
+Liveness: semua sumber kamera memakai pipeline yang sama dengan main.py (main.process_faces), termasuk
+uji keaslian wajah. Kotak kuning menampilkan instruksi (mis. "Tengok ke kiri lalu ke kanan"), merah
+"PALSU?" berarti percobaan spoofing (dicatat di spoof_log.csv + rekam jejak).
+
+Privasi (UU No. 27/2022): tambah orang WAJIB mencentang persetujuan subjek data setelah naskah
+ditampilkan (/privasi); persetujuan + petugas dicatat di persetujuan.json; hapus orang = data
+biometrik dihapus dan persetujuan ditandai. Database wajah dibaca/ditulis terenkripsi (privacy.py).
+PIN salah berulang kali dari satu alamat IP diblokir sementara (anti brute-force).
+
 Kamera absen punya tiga sumber:
   * CCTV RTSP      : (opsi --rtsp) worker ALWAYS-ON di server. Absen berjalan terus sejak dashboard hidup,
                      walau tidak ada browser yang terbuka, dan sambung ulang otomatis bila CCTV putus.
@@ -48,10 +57,13 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(BASE, "absensi.csv")
-DB_FILE = os.path.join(BASE, "faces_db.npz")
-from config import JAM_TERLAMBAT   # satu sumber konfigurasi: config.py
+import config                      # satu sumber konfigurasi: config.py
+import privacy
+from attendance import read_log
+
+BASE = config.BASE_DIR
+LOG_FILE = config.LOG_PATH
+DB_FILE = config.DB_PATH           # terenkripsi (privacy.py)
 _cache = {}
 _build_cache = {}
 
@@ -76,27 +88,26 @@ def cached(path, loader):
 
 
 def read_rows(path):
-    """Baris absensi: (tanggal, jam, nama, tipe, status). Baris lama 5 kolom dianggap tipe 'masuk'."""
-    rows = []
-    if path:
-        with open(path, newline="", encoding="utf-8") as f:
-            for r in csv.reader(f):
-                if len(r) >= 3 and r[0] != "tanggal":
-                    tipe = r[5] if len(r) > 5 and r[5] else "masuk"
-                    st = r[6] if len(r) > 6 and r[6] else ("terlambat" if r[1] > JAM_TERLAMBAT else "hadir")
-                    rows.append((r[0], r[1], r[2], tipe, st))
-    return rows
+    """Baris absensi: (tanggal, jam, nama, tipe, status). Pembaca format tunggal: attendance.parse_row."""
+    if not path:
+        return []
+    return [(d["tanggal"], d["jam"], d["nama"], d["tipe"], d["status"]) for d in read_log(path)]
 
 
-def read_names(path):
+def _load_db_names(path):
+    """[(nama, id)] dari database wajah TERENKRIPSI; [] bila belum ada / tidak bisa dibuka."""
     if not path:
         return []
     try:
-        import numpy as np
-        with np.load(path, allow_pickle=False) as d:
-            return sorted({str(n) for n in d["names"]})
-    except Exception:
+        names, ids, _ = privacy.load_db(path)
+        return list(zip(names, ids))
+    except Exception as e:
+        print(f"[DASHBOARD] database wajah tidak bisa dibaca: {e}")
         return []
+
+
+def read_names(path):
+    return sorted({n for n, _ in _load_db_names(path)})
 
 
 def _build(date):
@@ -208,6 +219,17 @@ def get_engine():
         return _core["engine"]
 
 
+def get_live():
+    """LivenessEngine bersama (None bila liveness_mode=off). Dipakai di bawah ENGINE_LOCK."""
+    main, engine = get_main(), get_engine()
+    with INIT_LOCK:
+        if "live" not in _core:
+            _core["live"] = main.make_liveness(engine)
+            print("[DASHBOARD] " + (_core["live"].describe() if _core["live"] else
+                                    "PERINGATAN: liveness NONAKTIF (rentan foto/video)"))
+        return _core["live"]
+
+
 def get_logger(main):
     """Satu logger bersama; membaca CSV hanya bila ada baris baru."""
     with INIT_LOCK:
@@ -217,28 +239,30 @@ def get_logger(main):
 
 
 def read_people(path):
-    """{nama: [jumlah_sampel, id]} dari faces_db.npz (hanya numpy)."""
-    if not path:
-        return {}
-    try:
-        import numpy as np
-        with np.load(path, allow_pickle=False) as d:
-            names = [str(n) for n in d["names"]]
-            ids = [str(i) for i in d["ids"]] if "ids" in d.files else [""] * len(names)
-    except Exception:
-        return {}
+    """{nama: [jumlah_sampel, id]} dari database wajah terenkripsi."""
     out = {}
-    for n, i in zip(names, ids):
+    for n, i in _load_db_names(path):
         out.setdefault(n, [0, i])[0] += 1
     return out
 
 
 def people_info():
     people = cached(DB_FILE, read_people)
-    return {"people": [{"nama": n, "id": v[1], "sampel": v[0]}
+    reg = privacy.consents()
+    ver = privacy.notice()[0]
+
+    def cons(n):
+        r = reg.get(n)
+        if not r or r.get("status") != "aktif":
+            return {"status": "belum"}
+        return {"status": "aktif", "tanggal": (r.get("diberikan") or "")[:10], "versi": r.get("versi_naskah"),
+                "petugas": r.get("petugas", "")}
+    return {"people": [{"nama": n, "id": v[1], "sampel": v[0], "persetujuan": cons(n)}
                        for n, v in sorted(people.items(), key=lambda x: x[0].casefold())],
             "editable": EDIT_ENABLED, "pin_required": bool(PIN),
-            "min_samples": MIN_SAMPLES, "max_images": MAX_IMAGES}
+            "min_samples": MIN_SAMPLES, "max_images": MAX_IMAGES,
+            "versi_naskah": ver, "wajib_persetujuan": config.WAJIB_PERSETUJUAN,
+            "liveness": config.LIVENESS_MODE}
 
 
 def clean_text(s, label, limit, required=False):
@@ -286,7 +310,11 @@ def embed_image(main, engine, data_url):
     width = int(faces[0][2] * scale[0])
     if width < main.REG_MIN_FACE_PX:
         raise ValueError(f"wajah terlalu kecil ({width}px, minimal {main.REG_MIN_FACE_PX}px)")
-    return engine.embed(img, faces[0], scale)
+    aligned = engine.align(img, faces[0], scale)
+    bad = main.sample_quality(aligned)            # tolak foto buram/gelap (embedding buruk -> FRR naik)
+    if bad:
+        raise ValueError(bad)
+    return engine.feature(aligned)
 
 
 def process_images(images):
@@ -313,19 +341,39 @@ def similar_warning(db, good, name):
     return ""
 
 
+def check_consent(d):
+    """Persetujuan eksplisit subjek data (UU PDP Pasal 20, 22) atas naskah versi TERKINI (Pasal 21)."""
+    if d.get("persetujuan") is not True:
+        raise ApiError(400, "Persetujuan subjek data wajib dicentang setelah naskah persetujuan dibacakan/dibaca.")
+    if str(d.get("versi_naskah") or "") != privacy.notice()[0]:
+        raise ApiError(409, "Naskah persetujuan sudah berubah. Muat ulang halaman lalu minta persetujuan ulang.")
+    return (clean_text(d.get("petugas"), "Petugas", 60, True),
+            clean_text(d.get("bukti"), "Bukti persetujuan", 80))
+
+
+def actor(handler_ip, petugas=""):
+    return f"{petugas or 'admin'}@dashboard({handler_ip})"
+
+
 def api_create(d):
     name, pid = clean_text(d.get("nama"), "Nama", 60, True), clean_text(d.get("id"), "ID", 40)
+    petugas, bukti = check_consent(d)
     check_images(d.get("images"), MIN_SAMPLES)
     db = get_main().Database(DB_FILE)
     if any(n.casefold() == name.casefold() for n in db.people()):
         raise ApiError(409, f"Nama '{name}' sudah terdaftar. Pakai 'Tambah sampel' untuk menambah foto.")
+    who = actor(d.get("_ip", "?"), petugas)
+    privacy.consents().give(name, pid, "dashboard", who, bukti)   # dicatat sebelum foto diproses
     good, rejected = process_images(d["images"])
     if len(good) < MIN_SAMPLES:
+        privacy.consents().withdraw(name, "pendaftaran gagal: foto tidak memenuhi syarat", status="batal", pelaku=who)
         raise ApiError(422, f"Hanya {len(good)} foto valid, minimal {MIN_SAMPLES}.", rejected)
     warn = similar_warning(db, good, name)
     db.add(name, pid, good)
     db.save()
-    return {"message": f"{name} ditambahkan ({len(good)} sampel).", "rejected": rejected, "warning": warn}
+    privacy.audit("wajah_didaftarkan", name, {"sampel": len(good), "metode": "dashboard"}, who)
+    return {"message": f"{name} ditambahkan ({len(good)} sampel, persetujuan tercatat).", "rejected": rejected,
+            "warning": warn}
 
 
 def api_add_samples(d):
@@ -334,13 +382,27 @@ def api_add_samples(d):
     db = get_main().Database(DB_FILE)
     if name not in db.people():
         raise ApiError(404, f"'{name}' tidak ditemukan.")
+    if not privacy.consents().is_active(name):
+        raise ApiError(403, f"'{name}' belum punya persetujuan aktif. Catat persetujuan dulu.")
     good, rejected = process_images(d["images"])
     if not good:
         raise ApiError(422, "Tidak ada foto yang valid.", rejected)
     warn = similar_warning(db, good, name)
     db.add(name, "", good)
     db.save()
+    privacy.audit("sampel_ditambah", name, {"sampel": len(good)}, actor(d.get("_ip", "?")))
     return {"message": f"{len(good)} sampel ditambahkan untuk {name}.", "rejected": rejected, "warning": warn}
+
+
+def api_consent(d):
+    """Catat persetujuan untuk orang yang SUDAH terdaftar (data lama sebelum fitur persetujuan)."""
+    name = str(d.get("nama") or "")
+    petugas, bukti = check_consent(d)
+    people = get_main().Database(DB_FILE).people()
+    if name not in people:
+        raise ApiError(404, f"'{name}' tidak ditemukan.")
+    privacy.consents().give(name, people[name][1], "dashboard", actor(d.get("_ip", "?"), petugas), bukti)
+    return {"message": f"Persetujuan {name} dicatat."}
 
 
 def api_update(d):
@@ -354,6 +416,13 @@ def api_update(d):
         raise ApiError(409, f"Nama '{new}' sudah dipakai.")
     db.update(old, new, pid)
     db.save()
+    reg = privacy.consents()
+    if new != old:
+        reg.rename(old, new)
+    if pid is not None:
+        reg.set_id(new, pid)
+    privacy.audit("data_diubah", new, {"nama_lama": old if new != old else "", "id_diubah": pid is not None},
+                  actor(d.get("_ip", "?")))
     return {"message": f"Data {new} diperbarui. Riwayat absensi lama tetap memakai nama sebelumnya."}
 
 
@@ -364,7 +433,12 @@ def api_delete(d):
     if not removed:
         raise ApiError(404, f"'{name}' tidak ditemukan.")
     db.save()
-    return {"message": f"{name} dihapus ({removed} sampel). Riwayat absensi tidak ikut terhapus."}
+    who = actor(d.get("_ip", "?"))
+    if privacy.consents().get(name):
+        privacy.consents().withdraw(name, "dihapus admin lewat dashboard", status="dihapus", pelaku=who)
+    privacy.audit("wajah_dihapus", name, {"sampel": removed, "alasan": "dashboard"}, who)
+    return {"message": f"{name} dihapus ({removed} sampel wajah dimusnahkan dari database terenkripsi). "
+                       "Riwayat absensi tidak ikut terhapus."}
 
 
 # ----------------------------- Kamera absen: frame dari browser -----------------------------
@@ -372,7 +446,7 @@ def scan_db(main):
     """Database untuk pemindaian; dimuat ulang otomatis bila file berubah."""
     db = _core.get("db")
     if db is None:
-        db = _core["db"] = main.Database(DB_FILE)
+        db = _core["db"] = main.Database(DB_FILE, require_consent=config.WAJIB_PERSETUJUAN)
     elif db.changed():
         db.reload()
         for s in _sessions.values():          # verifikasi ulang wajah yang sedang terlihat
@@ -394,6 +468,7 @@ def get_session(main, cam, now):
 
 def api_scan(raw, cam):
     main, engine = get_main(), get_engine()
+    live = get_live()
     np, cv2 = main.np, main.cv2
     img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
@@ -403,42 +478,36 @@ def api_scan(raw, cam):
     sh = max(1, round(h * sw / w))
     small = img if sw == w else cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
     scale = (w / sw, h / sh)
-    faces_out, events = [], []
+    faces_out = []
     now = time.time()
     with SCAN_LOCK:
         db, logger = scan_db(main), get_logger(main)
         tracker = get_session(main, cam, now)["tracker"]
         recheck = main._recheck_delay()
-        with ENGINE_LOCK:
-            rows = engine.detect(small)
-            near = [f for f in rows if f[2] * scale[0] >= SCAN_MIN_FACE_PX]
-            far = [f for f in rows if SCAN_MIN_FACE_PX * 0.5 <= f[2] * scale[0] < SCAN_MIN_FACE_PX]
-            fresh = tracker.update(near)
-            for t in fresh:
-                if now >= t.next_embed:       # embedding hanya bila perlu (sama seperti main.py)
-                    res = main.apply_match(t, *db.match(engine.embed(img, t.row, scale)),
-                                           now, logger, recheck)
-                    if res:
-                        dt, tipe, st = res
+        with ENGINE_LOCK:                     # pipeline sama persis dengan main.py run (termasuk liveness)
+            fresh, far, events = main.process_faces(engine.detect(small), img, scale, now, tracker, engine, db,
+                                                    logger, recheck, live, min_px=SCAN_MIN_FACE_PX,
+                                                    source="dashboard-browser")
+        for e in events:
+            if e["tipe"] != "spoof":
+                for t in fresh:
+                    if t.name == e["nama"]:
                         t.flash = now + 2.0
-                        events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S"),
-                                       "tipe": tipe, "status": st})
         for f in far:
             faces_out.append({"box": [float(f[0] / sw), float(f[1] / sh), float(f[2] / sw), float(f[3] / sh)],
                               "status": "far"})
         for t in fresh:
-            if t.name:
-                status = "tercatat" if now < getattr(t, "flash", 0.0) else "hadir"
-            elif t.cand:
-                status = "cek"
-            else:
-                status = "unknown"
+            status, text = main.track_view(t)
+            if status == "hadir" and now < getattr(t, "flash", 0.0):
+                status = "tercatat"
             item = {"box": [float(t.box[0] / sw), float(t.box[1] / sh), float(t.box[2] / sw), float(t.box[3] / sh)],
                     "status": status, "skor": round(float(t.score), 2)}
             if t.name or t.cand:
                 item["nama"] = t.name or t.cand
+            if status in ("liveness", "spoof"):
+                item["pesan"] = t.live.prompt() if t.live is not None else ""
             faces_out.append(item)
-        db_empty = db.is_empty()
+        db_empty = db.matchable() == 0
     return {"faces": faces_out, "events": events, "db_empty": db_empty}
 
 
@@ -535,8 +604,10 @@ class ServerScanner:
 
     def _loop(self, main, engine, cam):
         np, cv2 = main.np, main.cv2
-        db, logger, tracker = main.Database(DB_FILE), get_logger(main), main.Tracker()
+        db = main.Database(DB_FILE, require_consent=config.WAJIB_PERSETUJUAN)
+        logger, tracker, live = get_logger(main), main.Tracker(), get_live()
         recheck = main._recheck_delay()
+        src = "dashboard-cctv" if self.always else "dashboard-server"
         small = gbuf = None
         gi, have_prev, far = 0, False, []
         n, fps, t_prev, db_t = 0, 0.0, time.perf_counter(), 0.0
@@ -579,20 +650,11 @@ class ServerScanner:
                         t.next_embed = 0.0
             if n % main.DETECT_EVERY == 0:
                 with ENGINE_LOCK:
-                    faces = engine.detect(small)
-                    near = [f for f in faces if f[2] * scale[0] >= main.MIN_FACE_PX]
-                    far = [f for f in faces
-                           if main.MIN_FACE_PX * 0.5 <= f[2] * scale[0] < main.MIN_FACE_PX]
-                    for t in tracker.update(near):
-                        if now_t >= t.next_embed:
-                            res = main.apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
-                                                   now_t, logger, recheck)
-                            if res:
-                                dt, tipe, st = res
-                                with self.lock:
-                                    self.events = (self.events + [{
-                                        "nama": t.name, "tipe": tipe, "status": st,
-                                        "jam": dt.strftime("%H:%M:%S")}])[-20:]
+                    _, far, events = main.process_faces(engine.detect(small), frame, scale, now_t, tracker, engine,
+                                                        db, logger, recheck, live, source=src)
+                if events:
+                    with self.lock:
+                        self.events = (self.events + events)[-20:]
 
             t_now = time.perf_counter()
             inst = 1.0 / max(t_now - t_prev, 1e-6)
@@ -603,24 +665,7 @@ class ServerScanner:
                 self.jpeg = None                          # tidak ada penonton: lewati gambar + encode JPEG
                 continue
 
-            # gambar kotak langsung di frame (sama seperti main.py)
-            k = np.array([*scale, *scale], np.float32)
-            for f in far:
-                x, y, bw, bh = (int(v) for v in f[:4] * k)
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
-                main.put_text(frame, "Terlalu jauh", (x, max(y - 6, 14)), (210, 210, 210), 0.5)
-            for t in tracker.tracks.values():
-                if t.missed > 1:
-                    continue
-                x, y, bw, bh = (int(v) for v in t.box * k)
-                if t.name:
-                    color, label = (0, 200, 0), f"{t.name} {t.score:.2f}"
-                elif t.cand:
-                    color, label = (0, 200, 255), f"{t.cand}? {t.score:.2f}"
-                else:
-                    color, label = (0, 0, 255), f"Unknown {t.score:.2f}"
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-                main.put_text(frame, label, (x, max(y - 6, 14)), color)
+            main.draw_tracks(frame, tracker, far, scale)    # gambar kotak langsung di frame (sama seperti main.py)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 self.jpeg = buf.tobytes()
@@ -648,6 +693,7 @@ def api_cam_stop(d):
 
 
 ROUTES = {("POST", "/api/people"): api_create, ("POST", "/api/people/samples"): api_add_samples,
+          ("POST", "/api/consent"): api_consent,
           ("PUT", "/api/people"): api_update, ("DELETE", "/api/people"): api_delete,
           ("POST", "/api/server-cam/start"): api_cam_start,
           ("POST", "/api/server-cam/stop"): api_cam_stop}
@@ -655,6 +701,45 @@ ROUTES = {("POST", "/api/people"): api_create, ("POST", "/api/people/samples"): 
 
 def pin_ok(headers):
     return hmac.compare_digest(headers.get("X-Pin", "").encode(), PIN.encode())
+
+
+# ---- anti brute-force PIN: maks PIN_MAX_FAIL kegagalan per IP dalam PIN_WINDOW detik -> blokir ----
+PIN_MAX_FAIL, PIN_WINDOW, PIN_BLOCK = 5, 60.0, 120.0
+_pin_fail = {}
+_pin_lock = threading.Lock()
+
+
+def pin_blocked(ip):
+    with _pin_lock:
+        until = _pin_fail.get(ip, {}).get("blok", 0.0)
+        return max(0.0, until - time.time())
+
+
+def pin_failed(ip):
+    now = time.time()
+    with _pin_lock:
+        if len(_pin_fail) > 1000:                    # batasi memori
+            _pin_fail.clear()
+        r = _pin_fail.setdefault(ip, {"t": [], "blok": 0.0})
+        r["t"] = [t for t in r["t"] if now - t < PIN_WINDOW] + [now]
+        if len(r["t"]) >= PIN_MAX_FAIL:
+            r["blok"], r["t"] = now + PIN_BLOCK, []
+            print(f"[KEAMANAN] {ip} diblokir {PIN_BLOCK:.0f} dtk: PIN salah {PIN_MAX_FAIL}x.")
+            privacy.audit("pin_brute_force_diblokir", detail={"ip": ip}, pelaku=f"dashboard({ip})")
+
+
+def check_pin(handler):
+    """True bila PIN benar (atau PIN tidak dipakai). Mencatat kegagalan untuk anti brute-force."""
+    if not PIN:
+        return True
+    ip = handler.client_address[0]
+    if pin_blocked(ip):
+        return False
+    if pin_ok(handler.headers):
+        return True
+    if handler.headers.get("X-Pin"):                 # kosong = belum mengisi, bukan tebakan
+        pin_failed(ip)
+    return False
 
 
 PAGE = r"""<!doctype html>
@@ -833,7 +918,13 @@ dialog{border:1px solid var(--line);border-radius:var(--r-card);background:var(-
 dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog h2{margin:0 0 var(--s4);font-family:Lora,Georgia,serif;font-weight:500;font-size:22px}
 dialog label:not(.btn){display:block;margin:0 0 var(--s3);font-size:13.5px;font-weight:500}
-dialog input:not([type=file]){display:block;width:100%;margin-top:var(--s1);font-weight:400}
+dialog input:not([type=file]):not([type=checkbox]){display:block;width:100%;margin-top:var(--s1);font-weight:400}
+dialog label.chk{display:flex;gap:var(--s2);align-items:flex-start;font-weight:600}
+dialog label.chk input{margin-top:3px;width:18px;height:18px;flex:none;accent-color:var(--acc)}
+.consent{border:1px solid var(--line);border-radius:var(--r-inner);padding:var(--s3) var(--s4);margin:var(--s2) 0 var(--s4);background:var(--bg)}
+.consent summary{cursor:pointer;color:var(--acc);font-weight:600;font-size:13.5px}
+pre.notice{white-space:pre-wrap;font:12.5px/1.5 "Plus Jakarta Sans",system-ui,sans-serif;max-height:240px;overflow:auto;margin:var(--s2) 0;color:var(--mute)}
+.consent a{color:var(--acc)}
 .row{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin:var(--s2) 0}
 .row.end{justify-content:flex-end;margin-top:var(--s5)}
 video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner)}
@@ -857,6 +948,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
       <a href="#kamera" id="n-kamera"><svg class="ic" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Kamera absen</a>
       <a href="#kelola" id="n-kelola"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5M16 5a3.5 3.5 0 010 7M18 14.8c1.9.7 3.2 2.5 3.5 5.2"/></svg>Kelola wajah</a>
       <a href="#rekap" id="n-rekap"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Rekap kehadiran</a>
+      <a href="/privasi" target="_blank" rel="noopener"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>Naskah privasi</a>
     </nav>
     <div class="sfoot">
       <label id="pinbox" hidden>PIN admin <input type="password" id="pin" autocomplete="off"></label>
@@ -949,7 +1041,7 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
           <ul class="tips">
             <li>Jarak ideal 0,5 sampai 3 meter dari kamera.</li>
             <li>Pastikan cahaya cukup dan wajah menghadap lurus.</li>
-            <li>Kotak kuning berarti sedang memverifikasi, hijau berarti dikenali.</li>
+            <li>Kotak kuning berarti sedang memverifikasi; ikuti instruksinya (mis. tengok kiri lalu kanan) untuk uji keaslian wajah. Hijau berarti dikenali, merah "palsu" berarti foto/layar ditolak.</li>
             <li id="c-tip-srv">Kamera server memakai kamera komputer ini dan tidak bisa berjalan bersamaan dengan main.py run.</li>
           </ul>
         </div>
@@ -959,14 +1051,14 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
     <!-- KELOLA WAJAH -->
     <section id="v-kelola" hidden>
       <div class="hello">
-        <div><h1>Kelola wajah</h1><p class="sub">Tambah, ubah, atau hapus wajah terdaftar. Foto tidak disimpan, hanya data pengenal wajah (embedding).</p></div>
+        <div><h1>Kelola wajah</h1><p class="sub">Tambah, ubah, atau hapus wajah terdaftar. Foto tidak disimpan; hanya data pengenal wajah (embedding) yang disimpan terenkripsi, dan hanya dengan persetujuan subjek data.</p></div>
         <button class="btn pri" id="k-add" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Tambah orang</button>
       </div>
       <p id="k-msg" role="status" class="note"></p>
       <div class="card">
         <div class="card-h"><h2>Orang terdaftar</h2><span class="meta" id="k-count"></span></div>
         <div class="scroll tall"><table>
-        <thead><tr><th>Nama</th><th>ID</th><th>Sampel</th><th></th></tr></thead>
+        <thead><tr><th>Nama</th><th>ID</th><th>Sampel</th><th>Persetujuan</th><th></th></tr></thead>
         <tbody id="k-rows"></tbody>
       </table></div></div>
     </section>
@@ -990,6 +1082,13 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
   <h2 id="dlg-title">Tambah orang</h2>
   <label>Nama <input id="d-nama" maxlength="60" autocomplete="off"></label>
   <label>ID (opsional) <input id="d-id" maxlength="40" autocomplete="off"></label>
+  <div id="d-consent" class="consent">
+    <p class="mute">Tunjukkan atau bacakan <a href="/privasi" target="_blank" rel="noopener">naskah persetujuan</a> (versi <span id="d-ver">-</span>) kepada subjek data sebelum mengambil foto.</p>
+    <details><summary>Lihat naskah di sini</summary><pre class="notice" id="d-notice">Memuat...</pre></details>
+    <label class="chk"><input type="checkbox" id="d-setuju"> Subjek data telah membaca naskah dan secara eksplisit menyatakan SETUJU</label>
+    <label>Petugas yang mencatat <input id="d-petugas" maxlength="60" autocomplete="name"></label>
+    <label>No. formulir persetujuan tertulis (opsional) <input id="d-bukti" maxlength="80" autocomplete="off"></label>
+  </div>
   <div id="d-media">
     <div class="row">
       <label class="btn">Unggah foto <input type="file" id="d-file" accept="image/*" multiple hidden></label>
@@ -1079,6 +1178,7 @@ async function load() {
   try {
     const r = await fetch('/api/data?date=' + date, {cache: 'no-store', headers: pinHeader()});
     if (r.status === 401) { needPin(); $('status').textContent = 'Masukkan PIN admin'; $('dot').className = 'dot'; return; }
+    if (r.status === 429) { needPin(); $('status').textContent = (await r.json()).message; $('dot').className = 'dot'; return; }
     if (!r.ok) throw new Error(r.status);
     data = await r.json();
     draw();
@@ -1185,7 +1285,7 @@ $('export').onclick = async e => {
 // ---------- kamera absen ----------
 const cam = {stream: null, on: false, tok: 0};
 const srv = {on: false, tok: 0};
-const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#d97706', unknown: '#dc2626', far: '#78716c'};
+const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#d97706', liveness: '#d97706', spoof: '#dc2626', unknown: '#dc2626', far: '#78716c'};
 const grab = document.createElement('canvas');
 let toastTimer = null, reloadTimer = null;
 
@@ -1260,7 +1360,7 @@ async function scanLoop(tok, id) {
         drawFaces(j.faces);
         j.events.forEach(showToast);
         if (j.events.length) { clearTimeout(reloadTimer); reloadTimer = setTimeout(load, 300); }
-        setPill(j.db_empty ? 'Database wajah kosong. Tambahkan orang di Kelola wajah.'
+        setPill(j.db_empty ? 'Belum ada wajah dengan persetujuan aktif. Tambahkan/catat di Kelola wajah.'
           : j.faces.length ? `${j.faces.length} wajah terdeteksi` : 'Menunggu wajah...', j.db_empty);
       } catch (e) {
         if (cam.tok !== tok) return;
@@ -1291,6 +1391,8 @@ function drawFaces(list) {
     const col = COL[f.status] || COL.unknown;
     const text = f.status === 'tercatat' ? `✓ ${f.nama} · Tercatat`
       : f.status === 'hadir' ? `${f.nama} · Sudah dikenali`
+      : f.status === 'liveness' ? `${f.nama ? f.nama + ' · ' : ''}${f.pesan || 'Memeriksa keaslian'}`
+      : f.status === 'spoof' ? '⚠ Wajah palsu terdeteksi'
       : f.status === 'cek' ? `${f.nama}?`
       : f.status === 'far' ? 'Terlalu jauh' : 'Tidak dikenal';
     g.strokeStyle = col; g.lineWidth = 2.5; g.beginPath();
@@ -1306,6 +1408,12 @@ function drawFaces(list) {
 
 function showToast(e) {
   const t = $('c-toast');
+  if (e.tipe === 'spoof') {
+    t.innerHTML = `<span class="av" style="background:var(--bad-soft);color:var(--bad)">!</span>Ditolak: wajah palsu terdeteksi · ${esc(e.jam)}`;
+    t.classList.add('show'); clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+    return;
+  }
   const aksi = e.tipe === 'pulang' ? 'Pulang' : (e.status === 'terlambat' ? 'Terlambat' : 'Hadir');
   t.innerHTML = `<span class="av">${esc(ini(e.nama))}</span>${aksi}: ${esc(e.nama)} · ${esc(e.jam)}`;
   t.classList.add('show'); clearTimeout(toastTimer);
@@ -1400,14 +1508,20 @@ async function loadPeople() {
   $('pinbox').hidden = !info.pin_required;
   $('k-add').disabled = !info.editable;
   $('k-count').textContent = `${info.people.length} orang`;
-  $('k-rows').innerHTML = info.people.map((p, i) =>
-    `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td>${esc(p.id) || '<span class="mute">-</span>'}</td><td class="num">${p.sampel}</td>` +
-    `<td class="act"><button class="btn sm" data-a="samples" data-i="${i}">Tambah sampel</button> ` +
-    `<button class="btn sm" data-a="edit" data-i="${i}">Ubah</button> ` +
-    `<button class="btn sm bad" data-a="del" data-i="${i}">Hapus</button></td></tr>`).join('')
-    || '<tr><td colspan="4" class="mute">Belum ada wajah terdaftar.</td></tr>';
+  $('k-rows').innerHTML = info.people.map((p, i) => {
+    const ok = p.persetujuan && p.persetujuan.status === 'aktif';
+    const cons = ok ? `<span class="chip ok" title="versi ${esc(p.persetujuan.versi || '')} · ${esc(p.persetujuan.petugas || '')}">Aktif · ${esc(p.persetujuan.tanggal)}</span>`
+      : `<span class="chip late" title="Tidak dikenali saat absen sampai persetujuan dicatat">Belum ada</span>`;
+    return `<tr><td><div class="who"><span class="av">${esc(ini(p.nama))}</span>${esc(p.nama)}</div></td><td>${esc(p.id) || '<span class="mute">-</span>'}</td><td class="num">${p.sampel}</td><td>${cons}</td>` +
+      `<td class="act">` + (ok ? `<button class="btn sm" data-a="samples" data-i="${i}">Tambah sampel</button> `
+                              : `<button class="btn sm pri" data-a="consent" data-i="${i}">Catat persetujuan</button> `) +
+      `<button class="btn sm" data-a="edit" data-i="${i}">Ubah</button> ` +
+      `<button class="btn sm bad" data-a="del" data-i="${i}">Hapus</button></td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="mute">Belum ada wajah terdaftar.</td></tr>';
+  const nb = info.people.filter(p => !(p.persetujuan && p.persetujuan.status === 'aktif')).length;
+  if (nb && info.editable) say(`${nb} orang belum punya persetujuan dan tidak akan dikenali saat absen. Catat persetujuannya atau hapus datanya (UU PDP).`, true);
   if (!info.editable) say('Pengelolaan nonaktif: jalankan dashboard dengan --pin untuk mengaktifkannya dari jaringan.', true);
-  else if ($('k-msg').classList.contains('err')) say('');
+  else if (!nb && $('k-msg').classList.contains('err')) say('');
   if (pendingAdd) { pendingAdd = false; if (info.editable && view === 'kelola') openDlg('add'); }
 }
 
@@ -1417,13 +1531,25 @@ function renderThumbs() {
   $('d-count').textContent = `${imgs.length} foto dipilih. Disarankan 5-8 foto, wajah menghadap kamera, cahaya cukup.`;
 }
 
+let notice = null;
+async function loadNotice() {
+  try { notice = await (await fetch('/api/notice', {cache: 'no-store'})).json(); } catch (e) { notice = null; }
+  $('d-ver').textContent = notice ? notice.versi : '-';
+  $('d-notice').textContent = notice ? notice.teks : 'Naskah tidak bisa dimuat. Buka /privasi.';
+}
+
 function openDlg(m, p) {
   mode = m; target = p || null; imgs = [];
-  $('dlg-title').textContent = m === 'add' ? 'Tambah orang' : m === 'samples' ? `Tambah sampel: ${p.nama}` : `Ubah: ${p.nama}`;
+  $('dlg-title').textContent = m === 'add' ? 'Tambah orang' : m === 'samples' ? `Tambah sampel: ${p.nama}`
+    : m === 'consent' ? `Catat persetujuan: ${p.nama}` : `Ubah: ${p.nama}`;
   $('d-nama').value = p ? p.nama : ''; $('d-id').value = p ? p.id : '';
-  $('d-nama').disabled = $('d-id').disabled = m === 'samples';
-  $('d-media').hidden = m === 'edit';
-  $('d-save').textContent = m === 'edit' ? 'Simpan perubahan' : 'Simpan';
+  $('d-nama').disabled = $('d-id').disabled = m === 'samples' || m === 'consent';
+  $('d-media').hidden = m === 'edit' || m === 'consent';
+  $('d-consent').hidden = !(m === 'add' || m === 'consent');
+  $('d-setuju').checked = false; $('d-bukti').value = '';
+  try { $('d-petugas').value = localStorage.getItem('petugas') || ''; } catch (e) { /* abaikan */ }
+  if (!$('d-consent').hidden) loadNotice();
+  $('d-save').textContent = m === 'edit' ? 'Simpan perubahan' : m === 'consent' ? 'Simpan persetujuan' : 'Simpan';
   $('d-err').textContent = ''; $('d-camwrap').hidden = true; $('d-prompt').innerHTML = '&nbsp;';
   renderThumbs();
   $('dlg').showModal();
@@ -1477,12 +1603,19 @@ async function autoSnap() {
 
 async function save() {
   const nama = $('d-nama').value.trim(), id = $('d-id').value.trim();
+  const needConsent = mode === 'add' || mode === 'consent';
+  const cons = {persetujuan: $('d-setuju').checked, versi_naskah: notice ? notice.versi : '',
+                petugas: $('d-petugas').value.trim(), bukti: $('d-bukti').value.trim()};
+  if (needConsent && !cons.persetujuan) { $('d-err').textContent = 'Centang persetujuan subjek data terlebih dahulu.'; return; }
+  if (needConsent && !cons.petugas) { $('d-err').textContent = 'Isi nama petugas yang mencatat persetujuan.'; return; }
   if (mode === 'add' && imgs.length < info.min_samples) { $('d-err').textContent = `Minimal ${info.min_samples} foto.`; return; }
   if (mode === 'samples' && !imgs.length) { $('d-err').textContent = 'Pilih minimal 1 foto.'; return; }
+  if (needConsent) { try { localStorage.setItem('petugas', cons.petugas); } catch (e) { /* abaikan */ } }
   $('d-err').textContent = ''; $('d-save').disabled = true; $('d-save').textContent = 'Memproses...';
   try {
-    const j = mode === 'add' ? await api('POST', '/api/people', {nama, id, images: imgs})
+    const j = mode === 'add' ? await api('POST', '/api/people', {nama, id, images: imgs, ...cons})
       : mode === 'samples' ? await api('POST', '/api/people/samples', {nama: target.nama, images: imgs})
+      : mode === 'consent' ? await api('POST', '/api/consent', {nama: target.nama, ...cons})
       : await api('PUT', '/api/people', {nama: target.nama, nama_baru: nama, id});
     $('dlg').close();
     say(j.message + (j.warning ? ' ' + j.warning : '') + (j.rejected && j.rejected.length ? ' Ditolak: ' + j.rejected.join('; ') + '.' : ''));
@@ -1490,11 +1623,11 @@ async function save() {
   } catch (e) {
     $('d-err').textContent = e.message + (e.rejected && e.rejected.length ? ' (' + e.rejected.join('; ') + ')' : '');
   }
-  $('d-save').disabled = false; $('d-save').textContent = mode === 'edit' ? 'Simpan perubahan' : 'Simpan';
+  $('d-save').disabled = false; $('d-save').textContent = mode === 'edit' ? 'Simpan perubahan' : mode === 'consent' ? 'Simpan persetujuan' : 'Simpan';
 }
 
 async function del(p) {
-  if (!confirm(`Hapus ${p.nama} beserta ${p.sampel} sampel wajahnya? Riwayat absensi tidak ikut terhapus.`)) return;
+  if (!confirm(`Hapus ${p.nama} beserta ${p.sampel} sampel wajahnya? Data biometrik dimusnahkan dan persetujuan ditandai dihapus. Riwayat absensi tidak ikut terhapus.`)) return;
   try { say((await api('DELETE', '/api/people', {nama: p.nama})).message); } catch (e) { say(e.message, true); }
   loadPeople();
 }
@@ -1523,41 +1656,67 @@ route();
 """
 
 
+def notice_page():
+    ver, text, digest = privacy.notice()
+    esc = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return (f"<!doctype html><html lang=id><head><meta charset=utf-8><meta name=viewport content='width=device-width,"
+            f"initial-scale=1'><title>Naskah Persetujuan Data Biometrik</title><style>body{{margin:0;background:#faf9f7;"
+            f"color:#1f1d1a;font:15px/1.6 system-ui,sans-serif}}main{{max-width:760px;margin:0 auto;padding:32px 16px}}"
+            f"pre{{white-space:pre-wrap;font:inherit;background:#fff;border:1px solid #e5e0d8;border-radius:14px;"
+            f"padding:20px}}small{{color:#5c574f}}@media (prefers-color-scheme:dark){{body{{background:#1b1916;"
+            f"color:#f1ede6}}pre{{background:#2a2723;border-color:#3a362f}}small{{color:#b3ab9f}}}}</style></head>"
+            f"<body><main><pre>{esc}</pre><small>Versi {ver} &middot; SHA-256 {digest[:16]}&hellip;</small>"
+            f"</main></body></html>")
+
+
+SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+                    "Referrer-Policy": "no-referrer"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
     def send(self, code, body, ctype, extra=None):
-        b = body.encode("utf-8")
+        self.send_bytes(code, body.encode("utf-8"), ctype, extra)
+
+    def send_bytes(self, code, b, ctype, extra=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
+        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
-    def send_bytes(self, code, b, ctype):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(b)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(b)
+    def pin_denied(self):
+        """None bila boleh lanjut; selain itu (kode, pesan)."""
+        if check_pin(self):
+            return None
+        wait = pin_blocked(self.client_address[0])
+        if wait:
+            return 429, f"Terlalu banyak PIN salah. Coba lagi dalam {wait:.0f} detik."
+        return 401, "PIN salah." if self.headers.get("X-Pin") else "PIN diperlukan."
 
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8")
+        if u.path == "/privasi":       # publik: transparansi naskah persetujuan (UU PDP Pasal 21)
+            return self.send(200, notice_page(), "text/html; charset=utf-8")
+        if u.path == "/api/notice":
+            ver, text, digest = privacy.notice()
+            return self.send(200, json.dumps({"versi": ver, "teks": text, "sha256": digest}), JSON)
         if u.path == "/api/info":      # publik: hanya status PIN, mode edit, dan apakah CCTV aktif
             return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED,
-                                              "rtsp": scanner.always}), JSON)
+                                              "rtsp": scanner.always, "liveness": config.LIVENESS_MODE}), JSON)
         if u.path not in ("/api/people", "/api/data", "/export",
                           "/api/server-cam/frame", "/api/server-cam/status"):
             return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
-        if PIN and not pin_ok(self.headers):   # data absensi ikut dilindungi PIN
-            return self.send(401, json.dumps({"ok": False, "message": "PIN diperlukan."}), JSON)
+        denied = self.pin_denied()     # data absensi ikut dilindungi PIN
+        if denied:
+            return self.send(denied[0], json.dumps({"ok": False, "message": denied[1]}), JSON)
         if u.path == "/api/server-cam/frame":
             if not EDIT_ENABLED:
                 return self.send(403, "Nonaktif", "text/plain; charset=utf-8")
@@ -1583,6 +1742,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/data":
             self.send(200, json.dumps(build(date)), JSON)
         else:
+            privacy.audit("ekspor_csv", detail={"tanggal": date}, pelaku=f"dashboard({self.client_address[0]})")
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(["tanggal", "jam", "nama", "tipe", "status"])
@@ -1601,8 +1761,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "Host tidak diizinkan.")
         if not self.headers.get("Content-Type", "").startswith(ctype):
             raise ApiError(415, f"Content-Type harus {ctype}.")
-        if not pin_ok(self.headers):
-            raise ApiError(403, "PIN salah atau belum diisi.")
+        denied = self.pin_denied()
+        if denied:
+            raise ApiError(429 if denied[0] == 429 else 403,
+                           denied[1] if denied[0] == 429 else "PIN salah atau belum diisi.")
         n = int(self.headers.get("Content-Length") or 0)
         if not 0 < n <= limit:
             raise ApiError(413, "Ukuran data tidak valid atau terlalu besar.")
@@ -1621,6 +1783,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "JSON tidak valid.")
             if not isinstance(data, dict):
                 raise ApiError(400, "JSON tidak valid.")
+            data["_ip"] = self.client_address[0]          # untuk rekam jejak (tidak bisa diisi klien)
             with EDIT_LOCK:
                 out = action(data)
             print(f"[KELOLA] {out['message']}")

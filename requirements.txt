@@ -9,3 +9,14 @@ gspread
 # Opsional
 psutil      # tampilkan estimasi RAM di HUD
 openpyxl    # ekspor rekap ke .xlsx
+# Wajib
+opencv-python>=4.8        # YuNet, SFace, dnn (ONNX) - diuji dengan 4.x/5.0
+numpy>=1.23
+cryptography>=41          # enkripsi AES-256-GCM database wajah (privacy.py)
+
+# Opsional
+matplotlib>=3.6           # grafik pada evaluate.py
+openpyxl>=3.1             # ekspor rekap .xlsx
+psutil>=5.9               # tampilan RAM
+firebase-admin>=6         # sinkron Firestore (cloud_sync.py)
+gspread>=6                # sinkron Google Sheets (cloud_sync.py)

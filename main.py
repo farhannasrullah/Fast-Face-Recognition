@@ -12,8 +12,10 @@ Perintah:
   python main.py list                                  # daftar orang terdaftar
   python main.py delete --nama "Budi"                  # hapus data satu orang
   python main.py download-models                       # unduh model YuNet + SFace
+  python main.py privasi status                        # ringkasan enkripsi, persetujuan, rekam jejak
+  python main.py privasi --help                        # semua perintah privasi (UU PDP)
 
-Aturan absensi (atur di bagian KONFIGURASI):
+Aturan absensi (atur di config.py / config.json):
   * Scan pertama hari itu sampai JAM_TERLAMBAT (09:00)  -> MASUK, status "hadir".
   * Scan pertama setelah JAM_TERLAMBAT                  -> MASUK, status "terlambat".
   * Scan setelah JAM_PULANG (11:00) dari orang yang sudah masuk (hadir/terlambat) dan sudah
@@ -25,7 +27,17 @@ URL RTSP juga bisa diberikan lewat environment variable RTSP_URL.
 
 Cloud (opsional): jika cloud_sync.py ada di folder yang sama dan kredensial sudah diatur
 (serviceAccount.json + cloud_config.json atau env), setiap absen juga dikirim ke Firebase Firestore
-dan Google Sheets. absensi.csv tetap ditulis sebagai catatan lokal utama.
+dan Google Sheets. absensi.csv tetap ditulis sebagai catatan lokal utama. Data biometrik TIDAK dikirim.
+
+Liveness (liveness.py): absen hanya dicatat bila wajah lolos uji keaslian (config liveness_mode:
+pasif = model MiniFASNet, aktif = tantangan acak tengok kiri-kanan / dongak-tunduk, ganda = keduanya).
+Percobaan spoofing dicatat di spoof_log.csv dan audit_log.jsonl.
+
+Evaluasi kuantitatif (FAR/FRR/EER, identifikasi open-set, APCER/BPCER/ACER, latensi): evaluate.py.
+
+Privasi (privacy.py, UU No. 27/2022): faces_db.enc terenkripsi AES-256-GCM; pendaftaran wajib
+persetujuan eksplisit (naskah ditampilkan, dicatat di persetujuan.json); wajah tanpa persetujuan
+aktif tidak dikenali; semua aksi data dicatat di rekam jejak berantai hash.
 
 Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
   (baris lama 5 kolom tetap terbaca: dianggap tipe "masuk", status dihitung dari jamnya).
@@ -33,13 +45,14 @@ Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
 import argparse
 import csv
 import gc
+import json
 import os
 import re
 import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Opsi FFmpeg untuk RTSP: TCP (stabil) + tanpa buffer. Harus diset sebelum VideoCapture pertama.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay")
@@ -47,8 +60,11 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflag
 import cv2
 import numpy as np
 
-from attendance import AttendanceLogger
-from config import JAM_PULANG, JAM_TERLAMBAT, MIN_DURASI_MENIT
+import config
+import privacy
+from attendance import AttendanceLogger, purge_before, read_log
+from config import JAM_PULANG, JAM_TERLAMBAT
+from liveness import LivenessEngine
 
 try:  # opsional: untuk menampilkan estimasi RAM
     import psutil
@@ -57,11 +73,12 @@ except ImportError:
     _PROC = None
 
 # ============================ KONFIGURASI ============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-DB_PATH = os.path.join(BASE_DIR, "faces_db.npz")   # embedding + nama + id
-LOG_PATH = os.path.join(BASE_DIR, "absensi.csv")   # catatan absen (dibaca dashboard.py)
-EXPORT_DIR = os.path.join(BASE_DIR, "export")
+# Lokasi file diatur terpusat di config.py (sebelumnya disalin di beberapa modul).
+BASE_DIR = config.BASE_DIR
+MODEL_DIR = config.MODEL_DIR
+DB_PATH = config.DB_PATH           # embedding + nama + id, TERENKRIPSI (privacy.py)
+LOG_PATH = config.LOG_PATH         # catatan absen (dibaca dashboard.py)
+EXPORT_DIR = config.EXPORT_DIR
 
 YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 SFACE_FILE = "face_recognition_sface_2021dec.onnx"
@@ -99,12 +116,13 @@ PROFIL_AKTIF = "sedang"
 # Performa
 DETECT_EVERY = 3           # deteksi tiap N frame; frame lain dilacak (optical flow)
 CV_THREADS = 2             # batasi thread OpenCV agar CPU tidak penuh
-GC_EVERY_FRAMES = 900      # bersihkan memori berkala
+# (GC_EVERY_FRAMES dihapus: gc.collect() berkala tidak membebaskan buffer numpy/OpenCV - itu sudah
+#  dilepas lewat reference counting - dan hanya menambah jeda sesaat di loop kamera.)
 
 # Deteksi dan pengenalan
 NMS_THRESH = 0.3
-MATCH_THRESH = 0.40        # ambang skor orang (rata-rata 2 sampel terbaik; resmi SFace: 0.363)
-MATCH_MARGIN = 0.05        # selisih minimum skor orang terbaik vs kedua (0 = nonaktif)
+MATCH_THRESH = config.MATCH_THRESH   # ambang skor orang (rata-rata 2 sampel terbaik); kalibrasi: evaluate.py
+MATCH_MARGIN = config.MATCH_MARGIN   # selisih minimum skor orang terbaik vs kedua (0 = nonaktif)
 CONFIRM_MATCHES = 2        # kecocokan beruntun yang dibutuhkan sebelum dianggap dikenali
 UNKNOWN_RETRY_DETIK = 0.4  # jeda ekstraksi embedding ulang untuk wajah yang belum dikenali
 RECHECK_DETIK = 60         # verifikasi ulang wajah yang sudah dikenali (0 = tidak pernah)
@@ -119,6 +137,8 @@ WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikena
 REG_SAMPLES = 8
 REG_INTERVAL = 0.7         # detik antar pengambilan sampel
 REG_MIN_FACE_PX = 90       # wajah harus cukup besar saat registrasi (kualitas embedding)
+REG_MIN_SHARP = 25.0       # variansi Laplacian minimum crop wajah 112x112 (di bawah ini = buram)
+REG_BRIGHT = (40, 225)     # rentang rata-rata kecerahan crop wajah yang diterima
 REG_PROMPTS = ["Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan",
                "Dongak sedikit", "Tunduk sedikit", "Hadap lurus, rileks", "Senyum tipis",
                "Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan"]
@@ -338,6 +358,7 @@ class FaceEngine:
     """Pembungkus YuNet (deteksi) dan SFace (embedding), keduanya di CPU."""
 
     def __init__(self, yunet_path, sface_path):
+        self.yunet_path = yunet_path
         try:
             self.det = cv2.FaceDetectorYN.create(
                 yunet_path, "", (PROC_WIDTH, PROC_WIDTH), DETECT_SCORE, NMS_THRESH, 20,
@@ -358,42 +379,84 @@ class FaceEngine:
         _, faces = self.det.detect(small)
         return [] if faces is None else list(faces)
 
-    def embed(self, full, row, scale):
-        """Embedding 128-d ternormalisasi. Wajah di-crop dari frame resolusi penuh (lebih tajam)."""
+    def align(self, full, row, scale):
+        """Crop wajah 112x112 yang sudah disejajarkan, dari frame resolusi penuh (lebih tajam)."""
         r = row.copy()
         r[0:14:2] *= scale[0]
         r[1:14:2] *= scale[1]
-        feat = self.rec.feature(self.rec.alignCrop(full, r)).reshape(-1).astype(np.float32)
+        return self.rec.alignCrop(full, r)
+
+    def feature(self, aligned):
+        feat = self.rec.feature(aligned).reshape(-1).astype(np.float32)
         n = np.linalg.norm(feat)
         return feat / n if n > 0 else feat
+
+    def embed(self, full, row, scale):
+        """Embedding 128-d ternormalisasi."""
+        return self.feature(self.align(full, row, scale))
+
+
+def sample_quality(aligned):
+    """Gerbang kualitas sampel registrasi. Kembalikan alasan penolakan (str) atau None bila layak.
+    Sampel buram/gelap menghasilkan embedding yang buruk dan menaikkan salah tolak (FRR)."""
+    g = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    mean = float(g.mean())
+    if mean < REG_BRIGHT[0]:
+        return f"terlalu gelap (kecerahan {mean:.0f})"
+    if mean > REG_BRIGHT[1]:
+        return f"terlalu terang (kecerahan {mean:.0f})"
+    sharp = float(cv2.Laplacian(g, cv2.CV_64F).var())
+    if sharp < REG_MIN_SHARP:
+        return f"buram (ketajaman {sharp:.0f}, minimal {REG_MIN_SHARP:.0f})"
+    return None
 
 
 # ----------------------------- Database embedding -----------------------------
 class Database:
-    """Embedding di RAM sebagai matriks float32 (N,128).
+    """Embedding di RAM sebagai matriks float32 (N,128). File di disk TERENKRIPSI (privacy.py).
 
     Pencocokan dilakukan per orang: skor orang = rata-rata 2 sampel paling mirip (1 sampel bila
     hanya ada satu). Seluruhnya vektor (satu perkalian matriks + reduceat), tanpa loop Python.
+
+    require_consent=True (mode absen): hanya orang dengan persetujuan AKTIF yang masuk indeks
+    pencocokan (UU PDP Pasal 20). Data lain tetap ada untuk keperluan kelola (CRUD).
+    path=None: database di memori saja (dipakai evaluate.py).
     """
 
-    def __init__(self, path=DB_PATH):
+    def __init__(self, path=DB_PATH, require_consent=False):
         self.path = path
+        self.require_consent = require_consent
         self.names, self.ids = [], []
         self.embs = np.zeros((0, 128), np.float32)
+        self.excluded = []
         self._sig = None
-        self._load()
+        if path:
+            self._load()
         self._reindex()
 
-    # ---- deteksi perubahan file ----
+    @classmethod
+    def from_arrays(cls, names, ids, embs):
+        db = cls(path=None)
+        db.names, db.ids = list(names), list(ids)
+        db.embs = np.ascontiguousarray(embs, np.float32).reshape(-1, 128)
+        db._reindex()
+        return db
+
+    # ---- deteksi perubahan file (database + persetujuan) ----
     def _sig_now(self):
+        if not self.path:
+            return None
         try:
             st = os.stat(self.path)
-            return st.st_mtime_ns, st.st_size
+            sig = (st.st_mtime_ns, st.st_size)
         except OSError:
-            return None
+            sig = None
+        if self.require_consent:
+            return sig, privacy.consents().signature()
+        return sig
 
     def changed(self):
-        """True jika file database berubah (misalnya diedit lewat dashboard)."""
+        """True jika file database (atau persetujuan) berubah, misalnya diedit lewat dashboard."""
         return self._sig_now() != self._sig
 
     def reload(self):
@@ -401,49 +464,58 @@ class Database:
         self._reindex()
 
     def _load(self):
-        self._sig = self._sig_now()
-        if self._sig is None:
-            return
         try:
-            with np.load(self.path, allow_pickle=False) as d:  # 'with' agar file langsung ditutup
-                names = [str(x) for x in d["names"]]
-                embs = np.ascontiguousarray(d["embs"], dtype=np.float32)
-                ids = [str(x) for x in d["ids"]] if "ids" in d.files else [""] * len(names)
-            if not (len(names) == len(ids) == len(embs)):
-                raise ValueError("jumlah nama, id, dan embedding tidak sama")
+            if self.path == config.DB_PATH:
+                privacy.migrate_legacy(self.path)          # faces_db.npz lama -> terenkripsi
+            self._sig = self._sig_now()
+            names, ids, embs = privacy.load_db(self.path, migrate=False)
+        except privacy.PrivacyError as e:
+            raise RuntimeError(f"Database wajah tidak bisa dibuka ({self.path}): {e}")
         except Exception as e:
             raise RuntimeError(f"Database wajah rusak/tidak terbaca ({self.path}): {e}")
         self.names, self.ids, self.embs = names, ids, embs
 
     def _reindex(self):
         """Susun indeks per orang (urutan sampel dikelompokkan) untuk pencocokan vektor."""
-        if not self.names:
+        names, ids, embs = self.names, self.ids, self.embs
+        self.excluded = []
+        if self.require_consent and names:
+            ok = privacy.consents().active_names()
+            keep = np.array([n in ok for n in names], dtype=bool)
+            self.excluded = sorted({n for n in names if n not in ok})
+            names = [n for n, k in zip(names, keep) if k]
+            ids = [i for i, k in zip(ids, keep) if k]
+            embs = embs[keep]
+        if not names:
             self.uniq, self.uids = [], []
             self._counts = np.zeros(0, np.intp)
             self._starts = np.zeros(0, np.intp)
             self._es = np.zeros((0, 128), np.float32)
             return
-        uniq, inv = np.unique(np.array(self.names, dtype=str), return_inverse=True)
+        uniq, inv = np.unique(np.array(names, dtype=str), return_inverse=True)
         inv = inv.reshape(-1)
         order = np.argsort(inv, kind="stable")
         counts = np.bincount(inv, minlength=len(uniq)).astype(np.intp)
         starts = np.concatenate(([0], np.cumsum(counts)[:-1])).astype(np.intp)
-        ids = np.array(self.ids, dtype=str)
+        ids = np.array(ids, dtype=str)
         self._counts, self._starts = counts, starts
-        self._es = np.ascontiguousarray(self.embs[order])
+        self._es = np.ascontiguousarray(embs[order])
         self.uniq = [str(x) for x in uniq]
         self.uids = [str(x) for x in ids[order[starts]]]
 
     def save(self):
-        tmp = self.path + ".tmp.npz"  # tulis ke file sementara agar database tidak rusak saat crash
-        np.savez_compressed(tmp, names=np.array(self.names, dtype=str),
-                            ids=np.array(self.ids, dtype=str), embs=self.embs)
-        os.replace(tmp, self.path)
+        """Simpan terenkripsi (atomik, dikunci antar-proses agar dua penulis tidak bertabrakan)."""
+        with privacy.db_lock(self.path):
+            privacy.save_db(self.names, self.ids, self.embs, self.path)
         self._sig = self._sig_now()
 
     # ---- data ----
     def is_empty(self):
         return len(self.names) == 0
+
+    def matchable(self):
+        """Jumlah orang yang ikut dicocokkan (setelah filter persetujuan)."""
+        return len(self.uniq)
 
     def people(self):
         """{nama: [jumlah_sampel, id]}"""
@@ -535,6 +607,7 @@ class Track:
         self.weak = 0         # skor buruk beruntun pada wajah yang sudah dikenali
         self.score = 0.0
         self.next_embed = 0.0  # waktu paling cepat untuk ekstraksi embedding berikutnya
+        self.live = None       # liveness.LivenessState (dibuat saat pertama diproses)
         self.update(row)
 
     def update(self, row):
@@ -635,6 +708,9 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
         t.next_embed = now_t + UNKNOWN_RETRY_DETIK
         return None
     t.name, t.pid = name, pid
+    if t.live is not None and not t.live.passed:   # dikenali, tetapi BELUM lolos uji keaslian
+        t.next_embed = now_t + UNKNOWN_RETRY_DETIK  # dicek lagi segera setelah liveness lolos
+        return None
     t.next_embed = now_t + recheck
     dt = datetime.now()
     r = logger.try_log(name, pid, score, dt)
@@ -642,6 +718,107 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
         print(f"[{r[0].upper()}] {dt:%Y-%m-%d %H:%M:%S}  {name}  {r[1]}  (skor {score:.2f})")
         return dt, r[0], r[1]
     return None
+
+
+def report_spoof(t, source="main"):
+    """Catat percobaan spoofing (spoof_log.csv + rekam jejak) dan kembalikan event untuk UI."""
+    now = datetime.now()
+    cand = t.name or t.cand or ""
+    skor = t.live.mean if t.live is not None and t.live.mean is not None else 0.0
+    try:
+        new = not os.path.exists(config.SPOOF_LOG_PATH)
+        with open(config.SPOOF_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["tanggal", "jam", "kandidat", "skor_live", "sumber"])
+            w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), cand, f"{skor:.3f}", source])
+    except OSError as e:
+        print(f"[SPOOF] gagal menulis log: {e}")
+    privacy.audit("spoof_terdeteksi", cand, {"skor_live": round(skor, 3), "sumber": source})
+    print(f"[SPOOF] {now:%Y-%m-%d %H:%M:%S}  percobaan wajah palsu" + (f" (mirip {cand})" if cand else "")
+          + f"  skor asli {skor:.2f}")
+    return {"tipe": "spoof", "nama": cand, "id": "", "jam": now.strftime("%H:%M:%S"), "status": "ditolak",
+            "skor_live": round(skor, 3)}
+
+
+def process_faces(faces, frame, scale, now_t, tracker, engine, db, logger, recheck,
+                  live=None, min_px=None, source="main"):
+    """SATU pipeline per siklus deteksi: saring ukuran -> lacak -> liveness -> cocokkan -> catat.
+
+    Dipakai `main.py run`, kamera server/CCTV dashboard, dan kamera browser dashboard (sebelumnya
+    disalin di 3 tempat). Mengembalikan (track_segar, wajah_jauh, events)."""
+    min_px = MIN_FACE_PX if min_px is None else min_px
+    near = [f for f in faces if f[2] * scale[0] >= min_px]
+    far = [f for f in faces if min_px * 0.5 <= f[2] * scale[0] < min_px]
+    fresh = tracker.update(near)
+    events = []
+    k = np.array([*scale, *scale], np.float32)
+    for t in fresh:
+        if live is not None and live.enabled:
+            if t.live is None:
+                t.live = live.new_state()
+            if not t.live.passed:
+                lm = t.row[4:14].reshape(5, 2) * np.asarray(scale, np.float32)
+                if live.observe(t.live, frame, t.row[:4] * k, lm, now_t) == "spoof":
+                    events.append(report_spoof(t, source))
+                if t.live.passed and t.name:      # baru lolos: catat sekarang, jangan tunggu jeda verifikasi
+                    t.next_embed = 0.0
+        if now_t >= t.next_embed:          # embedding hanya jika perlu
+            res = apply_match(t, *db.match(engine.embed(frame, t.row, scale)), now_t, logger, recheck)
+            if res:
+                dt, tipe, st = res
+                events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S"),
+                               "tipe": tipe, "status": st})
+    return fresh, far, events
+
+
+def track_view(t):
+    """(status, teks) satu track untuk tampilan: tercatat/hadir | liveness | spoof | cek | unknown."""
+    lv = t.live
+    if lv is not None and lv.spoof:
+        return "spoof", f"PALSU? {t.name or t.cand or ''}".strip()
+    if t.name and (lv is None or lv.passed):
+        return "hadir", t.name
+    if (t.name or t.cand) and lv is not None and not lv.passed:
+        return "liveness", f"{t.name or t.cand}: {lv.prompt()}"
+    if t.cand:
+        return "cek", f"{t.cand}?"
+    return "unknown", "Unknown"
+
+
+_COLORS = {"hadir": (0, 200, 0), "liveness": (0, 200, 255), "cek": (0, 200, 255),
+           "spoof": (0, 0, 255), "unknown": (0, 0, 255)}
+
+
+def draw_tracks(frame, tracker, far, scale):
+    """Gambar kotak + label semua wajah di frame (main.py run dan dashboard kamera server)."""
+    k = np.array([*scale, *scale], np.float32)
+    for f in far:                            # petunjuk: ada wajah, tetapi terlalu jauh
+        x, y, bw, bh = (int(v) for v in f[:4] * k)
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
+        put_text(frame, f"Terlalu jauh ({bw}px, min {MIN_FACE_PX}px)", (x, max(y - 6, 14)), (210, 210, 210), 0.5)
+    for t in tracker.tracks.values():
+        if t.missed > 1:
+            continue
+        x, y, bw, bh = (int(v) for v in t.box * k)
+        status, label = track_view(t)
+        color = _COLORS[status]
+        label = _ascii(label) + f" {t.score:.2f}"
+        if t.live is not None and t.live.last is not None:
+            label += f" L{t.live.last:.2f}"
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+        put_text(frame, label, (x, max(y - 6, 14)), color)
+
+
+def _ascii(s):
+    """cv2.putText hanya mendukung ASCII."""
+    return str(s).encode("ascii", "replace").decode()
+
+
+def make_liveness(engine):
+    """LivenessEngine sesuai config (None bila liveness_mode=off)."""
+    live = LivenessEngine(yunet_path=engine.yunet_path)
+    return live if live.enabled else None
 
 
 def put_text(img, s, org, color, scale=0.55):
@@ -669,16 +846,45 @@ def _clean_field(value, label, limit):
 
 
 # ----------------------------- Mode registrasi -----------------------------
-def register(name, pid, n_samples, cam_index):
+def ask_consent(name, bukti=""):
+    """Tampilkan naskah (Pasal 21) lalu minta persetujuan eksplisit (Pasal 20, 22).
+
+    bukti: nomor/rujukan formulir persetujuan TERTULIS yang sudah ditandatangani (tanpa tanya).
+    Mengembalikan True bila setuju."""
+    if bukti:
+        return True
+    ver, text, _ = privacy.notice()
+    print("\n" + "=" * 78 + "\n" + text + "=" * 78)
+    if not sys.stdin.isatty():
+        raise ValueError("Persetujuan butuh input interaktif. Bila persetujuan tertulis sudah ditandatangani, "
+                         "pakai --bukti-persetujuan \"No. formulir\".")
+    ans = input(f"Subjek data '{name}': ketik SETUJU untuk memberikan persetujuan (selain itu = menolak): ")
+    return ans.strip().upper() == "SETUJU"
+
+
+def register(name, pid, n_samples, cam_index, bukti="", petugas="", skip_live=False):
     name = _clean_field(name, "Nama", 60)
     pid = _clean_field(pid, "ID", 40)
     if not name:
         raise ValueError("Nama tidak boleh kosong.")
+    if not ask_consent(name, bukti):
+        privacy.audit("persetujuan_ditolak", name, {"metode": "cli"})
+        print("Persetujuan tidak diberikan. Registrasi dibatalkan, tidak ada data wajah yang diproses.")
+        return
     cv2.setNumThreads(CV_THREADS)
     engine = FaceEngine(*ensure_models())
+    live = None if skip_live else make_liveness(engine)
+    if live is not None and live.passive is None:
+        live = None                          # registrasi diawasi petugas: cukup cek pasif (bila ada)
+    if skip_live:
+        privacy.audit("registrasi_tanpa_liveness", name, {"petugas": petugas or privacy.actor()})
     db = Database()
+    reg = privacy.consents()
+    already = reg.is_active(name)
+    if not already:                          # persetujuan dicatat SEBELUM data wajah diproses
+        reg.give(name, pid, "cli" if not bukti else "tertulis", petugas, bukti)
     cam = Camera(cam_index)
-    samples, last = [], 0.0
+    samples, last, reject, lscores, t_start = [], 0.0, "", [], time.time()
     print(f"Registrasi '{name}': hadap kamera, {n_samples} sampel diambil otomatis. Q/ESC untuk batal.")
     try:
         while len(samples) < n_samples:
@@ -691,13 +897,27 @@ def register(name, pid, n_samples, cam_index):
             faces = engine.detect(cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA))
             faces = [f for f in faces if f[2] * scale[0] >= REG_MIN_FACE_PX * 0.5]  # abaikan wajah kecil di latar
             if len(faces) == 1:
-                x, y, bw, bh = (int(v) for v in faces[0][:4] * np.array([*scale, *scale], np.float32))
+                box = faces[0][:4] * np.array([*scale, *scale], np.float32)
+                x, y, bw, bh = (int(v) for v in box)
                 big = bw >= REG_MIN_FACE_PX
                 msg = REG_PROMPTS[len(samples) % len(REG_PROMPTS)] if big else "Dekatkan wajah ke kamera"
                 color = (0, 220, 0) if big else (0, 165, 255)
                 if big and time.time() - last >= REG_INTERVAL:
-                    samples.append(engine.embed(frame, faces[0], scale))   # dari frame bersih
                     last = time.time()
+                    aligned = engine.align(frame, faces[0], scale)            # dari frame bersih
+                    reject = sample_quality(aligned) or ""
+                    if live is not None and not reject:                     # tolak foto/layar saat registrasi
+                        lscores = (lscores + [live.passive.score(frame, box) or 0.0])[-3:]
+                        if np.mean(lscores) < live.thresh:
+                            reject = f"tidak lolos uji keaslian ({np.mean(lscores):.2f})"
+                    if reject:
+                        color = (0, 165, 255)
+                    else:
+                        samples.append(engine.feature(aligned))
+                if reject:
+                    msg = "Ditolak: " + reject
+                    if "keaslian" in reject and time.time() - t_start > 15 and not samples:
+                        msg += " - perbaiki cahaya; bila yakin asli: --lewati-liveness"
                 mx = fw - x - bw                                           # koordinat pada pratinjau cermin
                 cv2.rectangle(show, (mx, y), (mx + bw, y + bh), color, 2)
             elif not faces:
@@ -714,6 +934,8 @@ def register(name, pid, n_samples, cam_index):
         cv2.destroyAllWindows()
 
     if len(samples) < n_samples:
+        if not already:
+            reg.withdraw(name, "registrasi dibatalkan sebelum data wajah disimpan", status="batal")
         print("Registrasi dibatalkan, tidak ada data yang disimpan.")
         return
     mean = np.mean(samples, axis=0)
@@ -725,24 +947,31 @@ def register(name, pid, n_samples, cam_index):
                   "Pastikan tidak terdaftar ganda dengan nama berbeda.")
     db.add(name, pid, samples)
     db.save()
-    print(f"Tersimpan: {name} (+{n_samples} sampel). Total terdaftar: {len(db.people())} orang.")
+    privacy.audit("wajah_didaftarkan", name, {"sampel": n_samples, "metode": "cli"})
+    print(f"Tersimpan (terenkripsi): {name} (+{n_samples} sampel). Total terdaftar: {len(db.people())} orang.")
 
 
 # ----------------------------- Mode absen -----------------------------
 def run_absen(source, headless=False):
     """source: index kamera lokal (int) atau URL RTSP (str)."""
     cv2.setNumThreads(CV_THREADS)
-    db = Database()
+    db = Database(require_consent=config.WAJIB_PERSETUJUAN)
     if db.is_empty():
         print("PERINGATAN: database wajah kosong. Tambahkan wajah lewat dashboard (tab Kelola wajah) atau "
               'python main.py register --nama "Nama". Mode absen tetap berjalan dan memuat otomatis.')
+    warn_no_consent(db)
     engine = FaceEngine(*ensure_models())
+    live = make_liveness(engine)
     logger, tracker = AttendanceLogger(), Tracker()
     recheck = _recheck_delay()
     cam = Camera(source)
-    print(f"Mode absen aktif ({len(db.people())} orang terdaftar). "
+    print(f"Mode absen aktif ({db.matchable()} orang dikenali). "
           f"Terlambat setelah {JAM_TERLAMBAT[:5]}, absen pulang mulai {JAM_PULANG[:5]}. "
+          + (live.describe() if live else "PERINGATAN: liveness NONAKTIF (rentan foto/video).") + ". "
           + ("Tekan Ctrl+C untuk berhenti." if headless else "Tekan Q / ESC untuk keluar."))
+    if live is not None and live.active and headless:
+        print("PERINGATAN: tantangan aktif (geleng/angguk) butuh layar; pada --headless pengguna tidak "
+              "melihat instruksi. Untuk CCTV pakai liveness_mode=pasif.")
 
     small, gbuf, gi, have_prev = None, None, 0, False
     far = []  # wajah terdeteksi tetapi terlalu kecil (jauh)
@@ -787,60 +1016,38 @@ def run_absen(source, headless=False):
                 if db.changed():
                     try:
                         db.reload()
-                        print(f"Database dimuat ulang: {len(db.people())} orang terdaftar.")
+                        print(f"Database dimuat ulang: {db.matchable()} orang dikenali.")
                     except RuntimeError as e:
                         print(f"PERINGATAN: {e}")
                     for t in tracker.tracks.values():
                         t.next_embed = 0.0           # verifikasi ulang wajah yang sedang terlihat
             if frame_no % DETECT_EVERY == 0:         # deteksi hanya tiap N frame
-                faces = engine.detect(small)
-                near = [f for f in faces if f[2] * scale[0] >= MIN_FACE_PX]
-                far = [f for f in faces if MIN_FACE_PX * 0.5 <= f[2] * scale[0] < MIN_FACE_PX]
-                for t in tracker.update(near):
-                    if now_t >= t.next_embed:        # embedding hanya jika perlu
-                        res = apply_match(t, *db.match(engine.embed(frame, t.row, scale)),
-                                          now_t, logger, recheck)
-                        if res:
-                            dt, tipe, st = res
-                            toast, toast_t = f"{tipe.capitalize()} ({st}): {t.name} {dt:%H:%M:%S}", now_t
+                _, far, events = process_faces(engine.detect(small), frame, scale, now_t, tracker, engine,
+                                               db, logger, recheck, live)
+                for e in events:
+                    if e["tipe"] == "spoof":
+                        toast, toast_t = f"DITOLAK: wajah palsu terdeteksi {e['jam']}", now_t
+                    else:
+                        toast, toast_t = f"{e['tipe'].capitalize()} ({e['status']}): {e['nama']} {e['jam']}", now_t
 
             t_now = time.perf_counter()
             inst = 1.0 / max(t_now - t_prev, 1e-6)
             fps, t_prev = (inst if fps == 0 else 0.9 * fps + 0.1 * inst), t_now
             if _PROC and now_t - ram_t > 1.0:
                 ram_mb, ram_t = _PROC.memory_info().rss / 2 ** 20, now_t
-            if frame_no % GC_EVERY_FRAMES == 0:
-                gc.collect()
 
             if headless:
                 time.sleep(0.001)
                 continue
-            k = np.array([*scale, *scale], np.float32)
-            for f in far:                            # petunjuk: ada wajah, tetapi terlalu jauh
-                x, y, bw, bh = (int(v) for v in f[:4] * k)
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (150, 150, 150), 1)
-                put_text(frame, f"Terlalu jauh ({bw}px, min {MIN_FACE_PX}px)", (x, max(y - 6, 14)),
-                         (210, 210, 210), 0.5)
-            for t in tracker.tracks.values():
-                if t.missed > 1:
-                    continue
-                x, y, bw, bh = (int(v) for v in t.box * k)
-                if t.name:
-                    color, label = (0, 200, 0), f"{t.name} {t.score:.2f}"
-                elif t.cand:
-                    color, label = (0, 200, 255), f"{t.cand}? {t.score:.2f}"
-                else:
-                    color, label = (0, 0, 255), f"Unknown {t.score:.2f}"
-                label += f" ({bw}px)"
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-                put_text(frame, label, (x, max(y - 6, 14)), color)
+            draw_tracks(frame, tracker, far, scale)
             hud = f"FPS {fps:.0f}" + (f" | RAM {ram_mb:.0f} MB" if ram_mb else "") + \
-                  f" | Hadir hari ini: {logger.count_today()}"
+                  f" | Hadir hari ini: {logger.count_today()}" + ("" if live else " | LIVENESS OFF")
             if db.is_empty():
                 hud += " | DB kosong"
             put_text(frame, hud, (10, 22), (255, 255, 255))
             if now_t - toast_t < 3.0:
-                put_text(frame, toast, (10, frame.shape[0] - 14), (0, 255, 0), 0.7)
+                put_text(frame, _ascii(toast), (10, frame.shape[0] - 14),
+                         (0, 0, 255) if toast.startswith("DITOLAK") else (0, 255, 0), 0.7)
             cv2.imshow(WIN_RUN, frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
@@ -861,22 +1068,16 @@ def export_rekap(dari, sampai, fmt):
         if s:
             datetime.strptime(s, "%Y-%m-%d")  # validasi format tanggal
     grp = {}
-    with open(LOG_PATH, newline="", encoding="utf-8") as f:
-        for r in csv.reader(f):
-            if len(r) < 3 or r[0] == "tanggal":
-                continue
-            tgl, jam, nama = r[0], r[1], r[2]
-            pid = r[3] if len(r) > 3 else ""
-            tipe = r[5] if len(r) > 5 and r[5] else "masuk"
-            status = r[6] if len(r) > 6 and r[6] else ("terlambat" if jam > JAM_TERLAMBAT else "hadir")
-            if (dari and tgl < dari) or (sampai and tgl > sampai):
-                continue
-            g = grp.setdefault((tgl, nama), {"id": pid, "masuk": "", "status": "", "pulang": ""})
-            g["id"] = pid or g["id"]
-            if tipe == "pulang":
-                g["pulang"] = max(g["pulang"], jam)
-            elif not g["masuk"] or jam < g["masuk"]:
-                g["masuk"], g["status"] = jam, status
+    for d in read_log(LOG_PATH):
+        tgl, jam, nama, pid, tipe, status = d["tanggal"], d["jam"], d["nama"], d["id"], d["tipe"], d["status"]
+        if (dari and tgl < dari) or (sampai and tgl > sampai):
+            continue
+        g = grp.setdefault((tgl, nama), {"id": pid, "masuk": "", "status": "", "pulang": ""})
+        g["id"] = pid or g["id"]
+        if tipe == "pulang":
+            g["pulang"] = max(g["pulang"], jam)
+        elif not g["masuk"] or jam < g["masuk"]:
+            g["masuk"], g["status"] = jam, status
     if not grp:
         raise RuntimeError("Tidak ada data absensi pada rentang tanggal tersebut.")
     rows = [[t, n, g["id"], g["masuk"], g["status"], g["pulang"]] for (t, n), g in sorted(grp.items())]
@@ -904,6 +1105,140 @@ def export_rekap(dari, sampai, fmt):
             w.writerow(header)
             w.writerows(rows)
     print(f"Rekap tersimpan: {path} ({len(rows)} baris)")
+    privacy.audit("ekspor_rekap", detail={"dari": dari or "", "sampai": sampai or "", "baris": len(rows),
+                                          "file": os.path.basename(path)})
+
+
+# ----------------------------- Privasi (UU PDP) -----------------------------
+def warn_no_consent(db):
+    if db.excluded:
+        print(f"PERINGATAN: {len(db.excluded)} orang terdaftar TANPA persetujuan aktif dan tidak akan dikenali: "
+              + ", ".join(db.excluded[:8]) + (" ..." if len(db.excluded) > 8 else "")
+              + '. Catat persetujuan: python main.py privasi catat --nama "..." atau hapus datanya.')
+
+
+def delete_person(name, alasan, status="dihapus"):
+    """Hapus data biometrik seseorang + tandai persetujuan (Pasal 8, 9, 43). Kembalikan jumlah sampel."""
+    db = Database()
+    removed = db.remove(name)
+    if removed:
+        db.save()
+    if privacy.consents().get(name):
+        privacy.consents().withdraw(name, alasan, status=status)
+    if removed:
+        privacy.audit("wajah_dihapus", name, {"sampel": removed, "alasan": alasan})
+    return removed
+
+
+def privasi_cmd(a):
+    reg = privacy.consents()
+    c = a.aksi
+    if c == "naskah":
+        print(privacy.notice()[1])
+    elif c == "status":
+        db = Database()
+        people = db.people()
+        cons = reg.all()
+        aktif = {n for n, r in cons.items() if r.get("status") == "aktif"}
+        tanpa = sorted(n for n in people if n not in aktif)
+        ok, n, msg = privacy.verify_audit()
+        enc = os.path.exists(config.DB_PATH)
+        print(f"Database wajah     : {config.DB_PATH} ({'TERENKRIPSI AES-256-GCM' if enc else 'belum ada'})")
+        print("Kunci              : " + ("FACEDB_PASSPHRASE (kata sandi)" if os.environ.get("FACEDB_PASSPHRASE")
+                                         else f"file {config.KEY_PATH}"))
+        print(f"Orang terdaftar    : {len(people)} ({sum(c for c, _ in people.values())} sampel)")
+        print(f"Persetujuan aktif  : {len(aktif)}   ditarik/batal/dihapus: {len(cons) - len(aktif)}")
+        print(f"Tanpa persetujuan  : {len(tanpa)}" + (" -> " + ", ".join(tanpa[:10]) if tanpa else ""))
+        print(f"Wajib persetujuan  : {'ya' if config.WAJIB_PERSETUJUAN else 'TIDAK (tidak sesuai UU PDP)'}")
+        print(f"Liveness           : {config.LIVENESS_MODE}")
+        print(f"Retensi absensi    : {config.RETENSI_HARI} hari")
+        print(f"Rekam jejak        : {'UTUH' if ok else 'RUSAK'} - {msg}")
+    elif c == "catat":
+        name = a.nama.strip()
+        db = Database()
+        if name not in db.people():
+            raise ValueError(f"'{name}' tidak terdaftar.")
+        if reg.is_active(name):
+            print(f"{name} sudah punya persetujuan aktif.")
+            return
+        if not ask_consent(name, a.bukti_persetujuan):
+            privacy.audit("persetujuan_ditolak", name, {"metode": "cli"})
+            print("Persetujuan tidak diberikan. Sesuai UU PDP, data wajahnya sebaiknya dihapus: "
+                  f'python main.py privasi tarik --nama "{name}"')
+            return
+        reg.give(name, db.people()[name][1], "tertulis" if a.bukti_persetujuan else "cli", a.petugas,
+                 a.bukti_persetujuan)
+        print(f"Persetujuan {name} dicatat.")
+    elif c == "tarik":
+        name = a.nama.strip()
+        removed = delete_person(name, a.alasan or "persetujuan ditarik subjek data", status="ditarik")
+        if not removed and not reg.get(name):
+            raise ValueError(f"'{name}' tidak ditemukan.")
+        print(f"Persetujuan {name} ditarik; {removed} sampel wajah dihapus dari database terenkripsi. "
+              "Riwayat absensi tetap (hapus lewat retensi bila tidak diperlukan lagi).")
+    elif c == "akses":
+        name = a.nama.strip()
+        db = Database()
+        people = db.people()
+        rows = [{k: v for k, v in d.items() if k != "t"} for d in read_log(LOG_PATH) if d["nama"] == name]
+        if name not in people and not rows and not reg.get(name):
+            raise ValueError(f"Tidak ada data untuk '{name}'.")
+        out = {"subjek": name, "dibuat": datetime.now().isoformat(timespec="seconds"),
+               "pengendali": config.PENGENDALI, "kontak_pdp": config.KONTAK_PDP,
+               "data_biometrik": {"jumlah_sampel_embedding": people.get(name, [0, ""])[0],
+                                  "id": people.get(name, [0, ""])[1],
+                                  "keterangan": "template wajah 128 angka per sampel, tersimpan terenkripsi; "
+                                                "foto tidak disimpan"},
+               "persetujuan": reg.get(name), "absensi": rows,
+               "rekam_jejak": privacy.audit_entries(name)}
+        path = a.keluar or os.path.join(EXPORT_DIR, f"data_subjek_{re.sub(r'[^A-Za-z0-9]+', '_', name)}.json")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        privacy.audit("akses_data_subjek", name, {"file": os.path.basename(path), "baris_absensi": len(rows)})
+        print(f"Salinan data pribadi {name} (Pasal 7): {path}")
+    elif c == "retensi":
+        hari = a.hari or config.RETENSI_HARI
+        cutoff = (datetime.now() - timedelta(days=hari)).date()
+        n, sisa = purge_before(cutoff, LOG_PATH, dry_run=not a.ya)
+        if not a.ya:
+            print(f"[SIMULASI] {n} catatan absensi lebih tua dari {cutoff} ({hari} hari) akan dihapus; {sisa} tersisa. "
+                  "Jalankan ulang dengan --ya untuk menghapus.")
+            return
+        privacy.audit("retensi_absensi", detail={"sebelum": str(cutoff), "dihapus": n})
+        print(f"{n} catatan absensi sebelum {cutoff} dihapus ({sisa} tersisa). "
+              "Salinan di Firestore: python cloud_sync.py retensi --hari " + str(hari))
+    elif c == "audit":
+        ok, n, msg = privacy.verify_audit()
+        print(("UTUH: " if ok else "PERINGATAN, RUSAK: ") + msg)
+        if a.nama:
+            for e in privacy.audit_entries(a.nama.strip()):
+                print(f"  {e['waktu']}  {e['aksi']:<24} {e.get('pelaku', '')}  {e.get('detail', {})}")
+        if not ok:
+            sys.exit(2)
+    elif c == "rotasi-kunci":
+        pw = None
+        if a.passphrase:
+            import getpass
+            pw = getpass.getpass("Kata sandi baru: ")
+            if pw != getpass.getpass("Ulangi kata sandi: ") or len(pw) < 12:
+                raise ValueError("Kata sandi tidak sama atau kurang dari 12 karakter.")
+        n = privacy.rotate_key(pw)
+        print(f"Database ({n} sampel) dienkripsi ulang dengan kunci baru."
+              + (" Mulai sekarang set FACEDB_PASSPHRASE sebelum menjalankan program." if pw else ""))
+    elif c == "hapus-tanpa-persetujuan":
+        db = Database()
+        tanpa = sorted(n for n in db.people() if not reg.is_active(n))
+        if not tanpa:
+            print("Semua wajah terdaftar memiliki persetujuan aktif.")
+            return
+        print(f"{len(tanpa)} orang tanpa persetujuan: " + ", ".join(tanpa))
+        if not a.ya:
+            print("Jalankan ulang dengan --ya untuk menghapus data wajah mereka.")
+            return
+        for n in tanpa:
+            delete_person(n, "tidak ada persetujuan aktif (pembersihan)")
+        print(f"Data wajah {len(tanpa)} orang dihapus.")
 
 
 # ----------------------------- CLI -----------------------------
@@ -918,6 +1253,11 @@ def main():
     p.add_argument("--kamera", type=int, default=CAM_INDEX)
     p.add_argument("--jarak", choices=list(PROFIL), default=PROFIL_AKTIF,
                    help="profil jarak: dekat (640x480, ringan), sedang (720p), jauh (720p, lebih sensitif)")
+    p.add_argument("--bukti-persetujuan", default="",
+                   help="rujukan formulir persetujuan TERTULIS yang sudah ditandatangani (lewati tanya SETUJU)")
+    p.add_argument("--petugas", default="", help="nama petugas yang mendaftarkan (rekam jejak)")
+    p.add_argument("--lewati-liveness", action="store_true",
+                   help="matikan cek keaslian saat registrasi (diawasi petugas; dicatat di rekam jejak)")
 
     p = sub.add_parser("run", help="mode absen otomatis")
     p.add_argument("--kamera", type=int, default=CAM_INDEX)
@@ -937,33 +1277,55 @@ def main():
     p.add_argument("--nama", required=True)
     sub.add_parser("download-models", help="unduh model YuNet dan SFace")
 
+    p = sub.add_parser("privasi", help="perlindungan data pribadi (UU No. 27/2022)",
+                       description="naskah | status | catat | tarik | akses | retensi | audit | rotasi-kunci | "
+                                   "hapus-tanpa-persetujuan")
+    p.add_argument("aksi", choices=["naskah", "status", "catat", "tarik", "akses", "retensi", "audit",
+                                    "rotasi-kunci", "hapus-tanpa-persetujuan"],
+                   help="naskah: tampilkan pemberitahuan (Pasal 21); status: ringkasan; catat: rekam persetujuan "
+                        "orang yang sudah terdaftar; tarik: tarik persetujuan + hapus wajah (Pasal 8-9); akses: "
+                        "salinan data subjek (Pasal 7); retensi: hapus absensi lama (Pasal 43); audit: verifikasi "
+                        "rekam jejak (Pasal 31); rotasi-kunci: enkripsi ulang dengan kunci baru")
+    p.add_argument("--nama", default="")
+    p.add_argument("--alasan", default="")
+    p.add_argument("--bukti-persetujuan", default="", help="rujukan formulir persetujuan tertulis")
+    p.add_argument("--petugas", default="")
+    p.add_argument("--keluar", default="", help="file keluaran untuk 'akses'")
+    p.add_argument("--hari", type=int, default=0, help="masa retensi (hari), bawaan dari config")
+    p.add_argument("--ya", action="store_true", help="benar-benar jalankan aksi penghapusan")
+    p.add_argument("--passphrase", action="store_true", help="rotasi-kunci: pakai kata sandi, bukan file kunci")
+
     a = ap.parse_args()
     try:
         if a.cmd in ("register", "run"):
             apply_profile(a.jarak)
-        if a.cmd == "register":
-            register(a.nama.strip(), a.id.strip(), a.jumlah, a.kamera)
+        if a.cmd == "privasi":
+            if a.aksi in ("catat", "tarik", "akses") and not a.nama.strip():
+                raise ValueError(f"privasi {a.aksi} butuh --nama")
+            privasi_cmd(a)
+        elif a.cmd == "register":
+            register(a.nama.strip(), a.id.strip(), a.jumlah, a.kamera, a.bukti_persetujuan.strip(), a.petugas,
+                     a.lewati_liveness)
         elif a.cmd == "run":
             run_absen(a.rtsp.strip() or a.kamera, a.headless)
         elif a.cmd == "export":
             export_rekap(a.dari, a.sampai, a.format)
         elif a.cmd == "list":
             people = Database().people()
+            reg = privacy.consents()
             if not people:
                 print("Belum ada wajah terdaftar.")
             for n, (c, i) in sorted(people.items()):
-                print(f"- {n}" + (f" (ID {i})" if i else "") + f": {c} sampel")
+                print(f"- {n}" + (f" (ID {i})" if i else "") + f": {c} sampel, persetujuan: "
+                      + ("aktif" if reg.is_active(n) else "BELUM ADA"))
         elif a.cmd == "delete":
-            db = Database()
-            removed = db.remove(a.nama.strip())
-            if removed:
-                db.save()
+            removed = delete_person(a.nama.strip(), "dihapus admin (main.py delete)")
             print(f"{removed} sampel milik '{a.nama}' dihapus." if removed else f"Nama '{a.nama}' tidak ditemukan.")
         elif a.cmd == "download-models":
             print("Model siap:", *ensure_models(), sep="\n  ")
     except KeyboardInterrupt:
         print("\nDihentikan.")
-    except (CameraError, RuntimeError, ValueError, OSError, cv2.error) as e:
+    except (CameraError, RuntimeError, ValueError, OSError, cv2.error, TimeoutError) as e:
         sys.exit(f"Error: {e}")
 
 

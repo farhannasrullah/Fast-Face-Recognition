@@ -1,0 +1,65 @@
+{
+ "versi": 1,
+ "subjek": {
+  "Alva": {
+   "nama": "Alva",
+   "id": "",
+   "status": "aktif",
+   "diberikan": "2026-11-13T21:59:19",
+   "versi_naskah": "1.0",
+   "hash_naskah": "086eea9b6e9739e8dd156cf8d814e76c5fc3a4e78095c12e765e1b6195d94676",
+   "metode": "dashboard",
+   "petugas": "Farhan@dashboard(127.0.0.1)",
+   "bukti": "",
+   "ditarik": null,
+   "alasan_tarik": ""
+  },
+  "Ambanung": {
+   "nama": "Ambanung",
+   "id": "",
+   "status": "aktif",
+   "diberikan": "2026-11-13T22:03:40",
+   "versi_naskah": "1.0",
+   "hash_naskah": "086eea9b6e9739e8dd156cf8d814e76c5fc3a4e78095c12e765e1b6195d94676",
+   "metode": "dashboard",
+   "petugas": "Farhan@dashboard(127.0.0.1)",
+   "bukti": "",
+   "ditarik": null,
+   "alasan_tarik": "",
+   "riwayat": [
+    {
+     "status": "dihapus",
+     "diberikan": "2026-11-13T22:01:03",
+     "ditarik": "2026-11-13T22:03:17",
+     "versi_naskah": "1.0"
+    }
+   ]
+  },
+  "Farhan Nasrullah": {
+   "nama": "Farhan Nasrullah",
+   "id": "1",
+   "status": "aktif",
+   "diberikan": "2026-11-13T22:01:07",
+   "versi_naskah": "1.0",
+   "hash_naskah": "086eea9b6e9739e8dd156cf8d814e76c5fc3a4e78095c12e765e1b6195d94676",
+   "metode": "dashboard",
+   "petugas": "Farhan@dashboard(127.0.0.1)",
+   "bukti": "",
+   "ditarik": null,
+   "alasan_tarik": ""
+  },
+  "Wanda": {
+   "nama": "Wanda",
+   "id": "",
+   "status": "aktif",
+   "diberikan": "2026-11-13T22:02:04",
+   "versi_naskah": "1.0",
+   "hash_naskah": "086eea9b6e9739e8dd156cf8d814e76c5fc3a4e78095c12e765e1b6195d94676",
+   "metode": "dashboard",
+   "petugas": "Farhan@dashboard(127.0.0.1)",
+   "bukti": "",
+   "ditarik": null,
+   "alasan_tarik": ""
+  }
+ }
+}

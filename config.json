@@ -1,0 +1,21 @@
+{
+  "jam_terlambat": "08:00",
+  "jam_pulang": "16:00",
+  "min_durasi_menit": 240,
+
+  "match_thresh": 0.40,
+  "match_margin": 0.05,
+
+  "liveness_mode": "off",
+  "liveness_thresh": 0.80,
+  "liveness_min_frames": 3,
+  "liveness_window": 8,
+  "tantangan_ambang": 0.28,
+  "tantangan_timeout": 8,
+  "tantangan_min_px": 100,
+
+  "wajib_persetujuan": true,
+  "retensi_hari": 365,
+  "pengendali": "Universitas Contoh - Fakultas Teknik",
+  "kontak_pdp": "pdp@contoh.ac.id / 0812-0000-0000"
+}
