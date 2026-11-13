@@ -23,6 +23,10 @@ Aturan absensi (atur di bagian KONFIGURASI):
 RTSP (CCTV): koneksi yang putus disambung ulang otomatis (backoff), program tidak berhenti.
 URL RTSP juga bisa diberikan lewat environment variable RTSP_URL.
 
+Cloud (opsional): jika cloud_sync.py ada di folder yang sama dan kredensial sudah diatur
+(serviceAccount.json + cloud_config.json atau env), setiap absen juga dikirim ke Firebase Firestore
+dan Google Sheets. absensi.csv tetap ditulis sebagai catatan lokal utama.
+
 Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
   (baris lama 5 kolom tetap terbaca: dianggap tipe "masuk", status dihitung dari jamnya).
 """
@@ -42,6 +46,11 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflag
 
 import cv2
 import numpy as np
+
+try:  # opsional: kirim absensi ke Firestore + Google Sheets
+    import cloud_sync
+except ImportError:
+    cloud_sync = None
 
 try:  # opsional: untuk menampilkan estimasi RAM
     import psutil
@@ -108,7 +117,7 @@ WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikena
 # Absensi
 JAM_TERLAMBAT = "09:00:00"  # masuk setelah jam ini = terlambat (format HH:MM:SS)
 JAM_PULANG = "11:00:00"     # scan setelah jam ini (dan sudah masuk) = absen pulang
-MIN_DURASI_MENIT = 30       # jarak minimum masuk -> pulang (mencegah masuk jam 11:05 langsung pulang)
+MIN_DURASI_MENIT = 0       # jarak minimum masuk -> pulang (mencegah masuk jam 11:05 langsung pulang)
 
 # Registrasi
 REG_SAMPLES = 8
@@ -510,6 +519,7 @@ class AttendanceLogger:
 
     CSV dibaca inkremental (hanya baris baru) dan disinkronkan sebelum setiap keputusan, sehingga
     aman dipakai bersama proses lain (dashboard, main.py kedua) tanpa catatan ganda.
+    Setiap catatan baru juga diantrekan ke cloud_sync (Firestore + Google Sheets) bila aktif.
     """
     HEADER = ["tanggal", "jam", "nama", "id", "skor", "tipe", "status"]
 
@@ -519,6 +529,8 @@ class AttendanceLogger:
         self._pos = 0    # posisi byte terakhir yang sudah dibaca
         self._lock = threading.RLock()
         self.sync()
+        if cloud_sync is not None:   # mulai sinkronisasi otomatis + catch-up absensi.csv saat program hidup
+            cloud_sync.start()
 
     def _apply(self, nama, t, tipe, status):
         """Perbarui status harian satu orang. Hari yang berbeda = mulai dari nol (reset harian)."""
@@ -590,6 +602,8 @@ class AttendanceLogger:
                 w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid,
                             f"{score:.3f}", tipe, status])
             self._apply(name, now, tipe, status)
+            if cloud_sync is not None:   # kirim ke Firestore + Google Sheets (non-blocking, tahan offline)
+                cloud_sync.enqueue(name, pid, score, now, tipe, status)
 
     def try_log(self, name, pid, score, now):
         """Sinkron -> putuskan -> tulis, satu langkah. Kembalikan (tipe, status) bila tercatat, selain itu None."""

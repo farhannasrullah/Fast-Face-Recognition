@@ -1,2 +1,27 @@
+# Kredensial dan konfigurasi rahasia (JANGAN sampai ter-commit)
+serviceAccount.json
+*serviceAccount*.json
+*-firebase-adminsdk-*.json
+cloud_config.json
+.env
+
+# State dan antrean sinkronisasi cloud
+cloud_state.json
+cloud_state.json.*.tmp
+cloud_outbox_*.jsonl
+cloud_outbox_*.jsonl.tmp
+
+# Data pribadi dan biometrik
 faces_db.npz
+faces_db.npz.tmp.npz
 absensi.csv
+export/
+
+# Model yang diunduh otomatis
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
