@@ -47,10 +47,8 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflag
 import cv2
 import numpy as np
 
-try:  # opsional: kirim absensi ke Firestore + Google Sheets
-    import cloud_sync
-except ImportError:
-    cloud_sync = None
+from attendance import AttendanceLogger
+from config import JAM_PULANG, JAM_TERLAMBAT, MIN_DURASI_MENIT
 
 try:  # opsional: untuk menampilkan estimasi RAM
     import psutil
@@ -115,9 +113,7 @@ TRACK_MAX_MISSED = 4       # siklus deteksi tanpa terdeteksi sebelum track dibua
 WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikenali dianggap Unknown
 
 # Absensi
-JAM_TERLAMBAT = "09:00:00"  # masuk setelah jam ini = terlambat (format HH:MM:SS)
-JAM_PULANG = "11:00:00"     # scan setelah jam ini (dan sudah masuk) = absen pulang
-MIN_DURASI_MENIT = 0       # jarak minimum masuk -> pulang (mencegah masuk jam 11:05 langsung pulang)
+# Jam terlambat / jam pulang / durasi minimum diatur terpusat di config.py (atau config.json / environment variable)
 
 # Registrasi
 REG_SAMPLES = 8
@@ -511,114 +507,6 @@ class Database:
         if name is not None and score >= MATCH_THRESH and margin < MATCH_MARGIN:
             return None, "", score
         return name, pid, score
-
-
-# ----------------------------- Pencatat absensi -----------------------------
-class AttendanceLogger:
-    """Catat absen masuk (hadir/terlambat) dan pulang ke CSV. Status di-reset otomatis tiap hari.
-
-    CSV dibaca inkremental (hanya baris baru) dan disinkronkan sebelum setiap keputusan, sehingga
-    aman dipakai bersama proses lain (dashboard, main.py kedua) tanpa catatan ganda.
-    Setiap catatan baru juga diantrekan ke cloud_sync (Firestore + Google Sheets) bila aktif.
-    """
-    HEADER = ["tanggal", "jam", "nama", "id", "skor", "tipe", "status"]
-
-    def __init__(self, path=LOG_PATH):
-        self.path = path
-        self.state = {}  # nama -> {"tgl": date, "masuk": datetime|None, "status": str, "pulang": datetime|None}
-        self._pos = 0    # posisi byte terakhir yang sudah dibaca
-        self._lock = threading.RLock()
-        self.sync()
-        if cloud_sync is not None:   # mulai sinkronisasi otomatis + catch-up absensi.csv saat program hidup
-            cloud_sync.start()
-
-    def _apply(self, nama, t, tipe, status):
-        """Perbarui status harian satu orang. Hari yang berbeda = mulai dari nol (reset harian)."""
-        s = self.state.get(nama)
-        if s is None or s["tgl"] != t.date():
-            if s is not None and t.date() < s["tgl"]:   # baris lama dari hari sebelumnya: abaikan
-                return
-            s = self.state[nama] = {"tgl": t.date(), "masuk": None, "status": "", "pulang": None}
-        if tipe == "pulang":
-            s["pulang"] = t
-        elif s["masuk"] is None:
-            s["masuk"], s["status"] = t, status
-
-    def _ingest(self, r):
-        if len(r) < 3 or r[0] == "tanggal":
-            return
-        try:
-            t = datetime.strptime(f"{r[0]} {r[1]}", "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return
-        tipe = r[5] if len(r) > 5 and r[5] else "masuk"
-        status = r[6] if len(r) > 6 and r[6] else ("terlambat" if r[1] > JAM_TERLAMBAT else "hadir")
-        self._apply(r[2], t, tipe, status)
-
-    def sync(self):
-        """Baca baris baru yang ditulis proses lain."""
-        with self._lock:
-            try:
-                size = os.stat(self.path).st_size
-            except OSError:
-                self.state.clear()
-                self._pos = 0
-                return
-            if size == self._pos:
-                return
-            if size < self._pos:  # file diganti/dipotong: baca ulang dari awal
-                self.state.clear()
-                self._pos = 0
-            with open(self.path, "rb") as f:
-                f.seek(self._pos)
-                data = f.read()
-            end = data.rfind(b"\n")
-            if end < 0:           # baris belum lengkap
-                return
-            self._pos += end + 1
-            for r in csv.reader(data[:end + 1].decode("utf-8", "replace").splitlines()):
-                self._ingest(r)
-
-    def decide(self, name, now):
-        """Tentukan catatan baru: ("masuk", "hadir"/"terlambat"), ("pulang", "pulang"), atau None."""
-        s = self.state.get(name)
-        if s is not None and s["tgl"] != now.date():
-            s = None                                   # hari baru = reset otomatis
-        jam = now.strftime("%H:%M:%S")
-        if s is None or s["masuk"] is None:
-            return "masuk", ("terlambat" if jam > JAM_TERLAMBAT else "hadir")
-        if (s["pulang"] is None and jam >= JAM_PULANG
-                and (now - s["masuk"]).total_seconds() >= MIN_DURASI_MENIT * 60):
-            return "pulang", "pulang"
-        return None
-
-    def log(self, name, pid, score, now, tipe, status):
-        with self._lock:
-            new = not os.path.exists(self.path)
-            with open(self.path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if new:
-                    w.writerow(self.HEADER)
-                w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), name, pid,
-                            f"{score:.3f}", tipe, status])
-            self._apply(name, now, tipe, status)
-            if cloud_sync is not None:   # kirim ke Firestore + Google Sheets (non-blocking, tahan offline)
-                cloud_sync.enqueue(name, pid, score, now, tipe, status)
-
-    def try_log(self, name, pid, score, now):
-        """Sinkron -> putuskan -> tulis, satu langkah. Kembalikan (tipe, status) bila tercatat, selain itu None."""
-        with self._lock:
-            self.sync()
-            d = self.decide(name, now)
-            if d is None:
-                return None
-            self.log(name, pid, score, now, *d)
-            return d
-
-    def count_today(self):
-        today = datetime.now().date()
-        with self._lock:
-            return sum(1 for s in self.state.values() if s["tgl"] == today and s["masuk"])
 
 
 # ----------------------------- Pelacak wajah -----------------------------

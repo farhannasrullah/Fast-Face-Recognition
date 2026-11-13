@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlparse
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "absensi.csv")
 DB_FILE = os.path.join(BASE, "faces_db.npz")
-JAM_TERLAMBAT = "09:00:00"   # HARUS sama dengan main.py; dipakai untuk baris lama tanpa kolom status
+from config import JAM_TERLAMBAT   # satu sumber konfigurasi: config.py
 _cache = {}
 _build_cache = {}
 

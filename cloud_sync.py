@@ -31,7 +31,7 @@ Konfigurasi: environment variable (huruf besar) ATAU file cloud_config.json di f
   firestore_daily      nama koleksi rekap harian (bawaan: rekap_harian)           FIRESTORE_DAILY
   gsheet_id            ID spreadsheet (kosong = Google Sheets nonaktif)           GSHEET_ID
   gsheet_tab           nama tab (bawaan: Absensi)                                 GSHEET_TAB
-  jam_terlambat        hanya untuk baris CSV lama tanpa kolom status (09:00:00)   JAM_TERLAMBAT
+  (jam_terlambat kini diatur di config.py / config.json / env JAM_TERLAMBAT)
 
 Perintah (opsional, untuk pengecekan manual):
   python cloud_sync.py test       # cek koneksi Firestore dan Google Sheets
@@ -81,7 +81,7 @@ def _truthy(v):
     return str(v).lower() in ("1", "true", "ya", "yes", "on")
 
 
-JAM_TERLAMBAT = cfg("jam_terlambat", "09:00:00")
+from config import JAM_TERLAMBAT   # satu sumber konfigurasi: config.py
 
 
 def name_key(nama):
