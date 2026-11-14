@@ -58,8 +58,8 @@ import time
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from config import LOG_PATH   # noqa: E402  (lokasi file terpusat di config.py)
-STATE_PATH = os.path.join(BASE_DIR, "cloud_state.json")   # kunci catatan yang sudah terkirim
+from config import LOG_PATH, DATA_DIR   # noqa: E402  (lokasi file terpusat di config.py)
+STATE_PATH = os.path.join(DATA_DIR, "cloud_state.json")   # kunci catatan yang sudah terkirim
 SHEET_HEADER = ["tanggal", "jam", "nama", "id", "skor", "tipe", "status", "key"]
 FS_BATCH = 200            # 2 tulisan per catatan -> 400 (batas Firestore 500)
 SHEET_CHUNK = 500
@@ -135,6 +135,17 @@ class CloudSync:
     def __init__(self, start_thread=True):
         self.cred = (os.environ.get("GOOGLE_CREDENTIALS") or str(_FILE.get("credentials") or "")
                      or "serviceAccount.json")
+        # Railway: isi JSON service account lewat env GOOGLE_CREDENTIALS_JSON (tanpa file di repo)
+        _cj = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+        if _cj:
+            try:
+                json.loads(_cj)
+                self.cred = os.path.join(DATA_DIR, "serviceAccount.json")
+                with open(self.cred, "w", encoding="utf-8") as _f:
+                    _f.write(_cj)
+                os.chmod(self.cred, 0o600)
+            except ValueError:
+                print("[CLOUD] GOOGLE_CREDENTIALS_JSON bukan JSON yang valid; diabaikan.")
         if not os.path.isabs(self.cred):
             self.cred = os.path.join(BASE_DIR, self.cred)
         has_cred = os.path.exists(self.cred)
@@ -147,7 +158,7 @@ class CloudSync:
         self.enabled = self.fs_on or self.gs_on
         self.source = os.path.splitext(os.path.basename(sys.argv[0] or "main"))[0] or "main"
         # satu outbox per program (main.py / dashboard.py) agar dua proses tidak saling menimpa
-        self.outbox = os.path.join(BASE_DIR, f"cloud_outbox_{self.source}.jsonl")
+        self.outbox = os.path.join(DATA_DIR, f"cloud_outbox_{self.source}.jsonl")
         self.pending = []
         self.state = {"fs": set(), "gs": set()}
         self._lock = threading.RLock()

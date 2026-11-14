@@ -1,3 +1,5 @@
 opencv-python-headless>=4.8
 numpy>=1.23
 cryptography>=41
+firebase-admin>=6
+gspread>=6
