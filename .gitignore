@@ -28,7 +28,6 @@ cloud_outbox_*.jsonl
 cloud_outbox_*.jsonl.tmp
 
 # Model (diunduh otomatis)
-models/
 
 # Python
 __pycache__/
