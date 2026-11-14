@@ -1824,10 +1824,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global PIN, EDIT_ENABLED, RTSP_URL, JARAK
     ap = argparse.ArgumentParser(description="Dashboard Admin Absensi Wajah")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT") or 8000))
     ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("--pin", default="", help="PIN admin untuk kamera absen, pengelolaan wajah, dan data absensi (wajib jika --host bukan localhost)")
+    ap.add_argument("--pin", default=os.environ.get("ADMIN_PIN", ""), help="PIN admin untuk kamera absen, pengelolaan wajah, dan data absensi (wajib jika --host bukan localhost)")
     ap.add_argument("--rtsp", default=os.environ.get("RTSP_URL", ""),
                     help="URL RTSP CCTV: absen berjalan terus (always-on) sejak dashboard hidup")
     ap.add_argument("--jarak", choices=["dekat", "sedang", "jauh"], default=None,
