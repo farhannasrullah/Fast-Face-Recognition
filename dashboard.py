@@ -1839,6 +1839,13 @@ def main():
         print("PERINGATAN: dashboard terbuka di jaringan tanpa --pin, jadi kamera absen dan pengelolaan wajah "
               "dinonaktifkan (hanya baca). Data absensi bisa dibaca siapa pun di jaringan; pakai --pin untuk melindunginya.")
 
+    try:                                   # cadangan Firestore: pulihkan data hilang + unggah berkala
+        import cloud_backup
+        cloud_backup.restore()
+        cloud_backup.start()
+    except ImportError:
+        pass
+
     server = ThreadingHTTPServer((a.host, a.port), Handler)
     url = f"http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}"
     print(f"Dashboard berjalan di {url}  (Ctrl+C untuk berhenti)")
