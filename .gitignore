@@ -1,23 +1,33 @@
-# Kredensial dan konfigurasi rahasia (JANGAN sampai ter-commit)
+# Kredensial dan konfigurasi rahasia
 serviceAccount.json
 *serviceAccount*.json
 *-firebase-adminsdk-*.json
 cloud_config.json
 .env
 
-# State dan antrean sinkronisasi cloud
+# Data biometrik, kunci, dan data pribadi
+kunci/
+*.key
+*.key.lama-*
+faces_db.enc
+faces_db.npz
+*.lock
+persetujuan.json
+audit_log.jsonl
+spoof_log.csv
+absensi.csv
+export/
+hasil_evaluasi/
+dataset/
+dataset_liveness/
+
+# State sinkronisasi cloud
 cloud_state.json
 cloud_state.json.*.tmp
 cloud_outbox_*.jsonl
 cloud_outbox_*.jsonl.tmp
 
-# Data pribadi dan biometrik
-faces_db.npz
-faces_db.npz.tmp.npz
-absensi.csv
-export/
-
-# Model yang diunduh otomatis
+# Model (diunduh otomatis)
 models/
 
 # Python
@@ -25,3 +35,4 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+x.json
