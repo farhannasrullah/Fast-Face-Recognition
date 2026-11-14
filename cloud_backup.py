@@ -113,6 +113,7 @@ def restore():
             _last[name] = _sha(data)
             print(f"[BACKUP] dipulihkan dari Firestore: {name} ({len(data)} byte)")
         _ok_to_upload = True
+        print(f"[BACKUP] siap: cek tiap {INTERVAL} dtk, koleksi Firestore '{COLLECTION}'.")
     except Exception as e:      # jangan menjatuhkan dashboard karena cadangan
         print(f"[BACKUP] pemulihan GAGAL ({str(e)[:200]}); unggahan cadangan ditunda.")
         _ok_to_upload = False
