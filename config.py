@@ -50,17 +50,21 @@ import os
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Folder data yang BERUBAH (csv, database, kunci, audit). Di Railway arahkan ke Volume (mis. /data),
+# karena disk container hilang tiap deploy. Lokal: sama dengan BASE_DIR (perilaku lama).
+DATA_DIR = os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or BASE_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ----------------------------- lokasi file (satu tempat) -----------------------------
-LOG_PATH = os.path.join(BASE_DIR, "absensi.csv")              # catatan absen
-DB_PATH = os.path.join(BASE_DIR, "faces_db.enc")              # embedding wajah TERENKRIPSI (AES-256-GCM)
-LEGACY_DB_PATH = os.path.join(BASE_DIR, "faces_db.npz")       # format lama (polos), dimigrasi otomatis
-CONSENT_PATH = os.path.join(BASE_DIR, "persetujuan.json")     # catatan persetujuan subjek data
-AUDIT_PATH = os.path.join(BASE_DIR, "audit_log.jsonl")        # rekam jejak berantai hash (Pasal 31)
-SPOOF_LOG_PATH = os.path.join(BASE_DIR, "spoof_log.csv")      # percobaan spoofing yang terdeteksi
+LOG_PATH = os.path.join(DATA_DIR, "absensi.csv")              # catatan absen
+DB_PATH = os.path.join(DATA_DIR, "faces_db.enc")              # embedding wajah TERENKRIPSI (AES-256-GCM)
+LEGACY_DB_PATH = os.path.join(DATA_DIR, "faces_db.npz")       # format lama (polos), dimigrasi otomatis
+CONSENT_PATH = os.path.join(DATA_DIR, "persetujuan.json")     # catatan persetujuan subjek data
+AUDIT_PATH = os.path.join(DATA_DIR, "audit_log.jsonl")        # rekam jejak berantai hash (Pasal 31)
+SPOOF_LOG_PATH = os.path.join(DATA_DIR, "spoof_log.csv")      # percobaan spoofing yang terdeteksi
 NOTICE_PATH = os.path.join(BASE_DIR, "naskah_persetujuan.txt")  # opsional: naskah persetujuan kustom
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-EXPORT_DIR = os.path.join(BASE_DIR, "export")
+EXPORT_DIR = os.path.join(DATA_DIR, "export")
 
 _DEFAULTS = {
     "jam_terlambat": "09:00:00", "jam_pulang": "11:00:00", "min_durasi_menit": "120",
@@ -167,4 +171,4 @@ WAJIB_PERSETUJUAN = _bool("wajib_persetujuan")
 RETENSI_HARI = _int("retensi_hari", 1)
 PENGENDALI = _get("pengendali")
 KONTAK_PDP = _get("kontak_pdp")
-KEY_PATH = os.environ.get("FACEDB_KEY_FILE") or os.path.join(BASE_DIR, "kunci", "facedb.key")
+KEY_PATH = os.environ.get("FACEDB_KEY_FILE") or os.path.join(DATA_DIR, "kunci", "facedb.key")

@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.git/
+.venv/
+# data & rahasia JANGAN ikut image
+absensi.csv*
+faces_db.*
+persetujuan.json
+audit_log.jsonl
+spoof_log.csv
+kunci/
+export/
+serviceAccount.json
+cloud_state.json
+cloud_outbox_*.jsonl
+config.json
+test_*.py
+uji_fungsional.py
+evaluate.py
