@@ -296,7 +296,9 @@ format menghentikan program dengan pesan yang jelas.
 | `match_margin` | `0.05` | Selisih minimum skor orang terbaik vs kedua (0 = nonaktif) |
 | `liveness_mode` | `pasif` | `off` / `pasif` / `aktif` / `ganda` |
 | `liveness_thresh` | `0.80` | Ambang probabilitas "asli" model pasif |
-| `liveness_min_frames` / `liveness_window` | `3` / `8` | Frame minimum untuk lolos / jendela keputusan spoof |
+| `liveness_min_frames` / `liveness_window` | `3` / `8` | Frame minimum untuk lolos / jendela keputusan |
+| `liveness_spoof_thresh` | `0.50` | Rata-rata di bawah ini (jendela penuh) = dicap PALSU. Di antara ini dan `liveness_thresh` = "belum yakin": tidak dicatat, tidak dicap palsu |
+| `liveness_min_px` | `80` | Lebar wajah minimum agar model pasif menilai; wajah lebih kecil atau terpotong tepi layar diminta mendekat/ke tengah (`0` = nonaktif) |
 | `tantangan_ambang` | `0.28` | Rentang koordinat afin minimum untuk tantangan aktif |
 | `tantangan_timeout` | `8` | Detik untuk menyelesaikan tantangan |
 | `tantangan_min_px` | `100` | Lebar wajah minimum untuk tantangan aktif |

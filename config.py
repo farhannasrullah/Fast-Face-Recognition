@@ -20,7 +20,12 @@ Liveness / anti-spoofing (kalibrasi lewat `python evaluate.py liveness`)
                        ganda = keduanya harus lolos (paling aman untuk kios absen)
   liveness_thresh      ambang rata-rata probabilitas "asli" model pasif             (0.80)
   liveness_min_frames  jumlah frame minimum sebelum diputuskan "asli"                (3)
-  liveness_window      jumlah frame jendela keputusan (spoof bila rata-rata < ambang)(8)
+  liveness_window      jumlah frame jendela keputusan                               (8)
+  liveness_spoof_thresh  rata-rata di BAWAH ini (setelah jendela penuh) = dinyatakan PALSU.
+                       Antara spoof_thresh dan liveness_thresh = "belum yakin": tidak dicatat,
+                       tidak dicap palsu, pengguna diminta mendekat/memperbaiki cahaya  (0.50)
+  liveness_min_px      lebar wajah minimum (px, frame asli) agar model pasif mau menilai.
+                       Wajah lebih kecil/terpotong tepi layar TIDAK dinilai (0 = nonaktif) (80)
   tantangan_ambang     rentang koordinat afin hidung minimum agar tantangan lolos    (0.28)
   tantangan_timeout    detik untuk menyelesaikan tantangan                          (8)
   tantangan_min_px     lebar wajah minimum (px, frame asli) untuk tantangan aktif    (100)
@@ -62,6 +67,7 @@ _DEFAULTS = {
     "match_thresh": "0.40", "match_margin": "0.05",
     "liveness_mode": "pasif", "liveness_thresh": "0.80",
     "liveness_min_frames": "3", "liveness_window": "8",
+    "liveness_spoof_thresh": "0.50", "liveness_min_px": "80",
     "tantangan_ambang": "0.28", "tantangan_timeout": "8", "tantangan_min_px": "100",
     "wajib_persetujuan": "true", "retensi_hari": "365",
     "pengendali": "(isi nama instansi di config.json: \"pengendali\")",
@@ -148,6 +154,11 @@ LIVENESS_MODE = _choice("liveness_mode", ("off", "pasif", "aktif", "ganda"))
 LIVENESS_THRESH = _float("liveness_thresh", 0.0, 1.0)
 LIVENESS_MIN_FRAMES = _int("liveness_min_frames", 1, 100)
 LIVENESS_WINDOW = max(_int("liveness_window", 1, 200), LIVENESS_MIN_FRAMES)
+LIVENESS_SPOOF_THRESH = _float("liveness_spoof_thresh", 0.0, 1.0)
+LIVENESS_MIN_PX = _int("liveness_min_px", 0, 2000)
+if LIVENESS_SPOOF_THRESH > LIVENESS_THRESH:
+    raise ValueError(f"Konfigurasi 'liveness_spoof_thresh' ({LIVENESS_SPOOF_THRESH}) tidak boleh lebih besar "
+                     f"dari 'liveness_thresh' ({LIVENESS_THRESH}).")
 TANTANGAN_AMBANG = _float("tantangan_ambang", 0.01, 2.0)
 TANTANGAN_TIMEOUT = _int("tantangan_timeout", 2, 120)
 TANTANGAN_MIN_PX = _int("tantangan_min_px", 20, 2000)

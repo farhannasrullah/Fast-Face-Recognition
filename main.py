@@ -45,6 +45,7 @@ Format absensi.csv: tanggal, jam, nama, id, skor, tipe, status
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import re
@@ -93,6 +94,11 @@ MODEL_URLS = {
     ],
 }
 MODEL_MIN_BYTES = {YUNET_FILE: 100_000, SFACE_FILE: 10_000_000}  # deteksi file rusak/tidak lengkap
+# SHA-256 model (dari salinan yang sudah teruji di proyek ini). Unduhan yang hash-nya tidak cocok DITOLAK.
+MODEL_SHA256 = {
+    YUNET_FILE: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    SFACE_FILE: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+}
 
 # Kamera
 CAM_INDEX = 0
@@ -163,7 +169,15 @@ class CameraError(RuntimeError):
 
 
 # ----------------------------- Model -----------------------------
-def _download(urls, dest, min_bytes):
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _download(urls, dest, min_bytes, sha256=None):
     err = None
     for url in urls:
         tmp = dest + ".part"
@@ -177,6 +191,8 @@ def _download(urls, dest, min_bytes):
                     f.write(chunk)
             if os.path.getsize(tmp) < min_bytes:
                 raise ValueError("ukuran file terlalu kecil (bukan model yang valid)")
+            if sha256 and _sha256(tmp) != sha256:
+                raise ValueError("SHA-256 tidak cocok (file rusak atau bukan model yang diharapkan)")
             os.replace(tmp, dest)
             return True
         except Exception as e:
@@ -195,10 +211,13 @@ def ensure_models():
         p = os.path.join(MODEL_DIR, name)
         if not (os.path.exists(p) and os.path.getsize(p) >= MODEL_MIN_BYTES[name]):
             print(f"Model {name} belum ada, mengunduh...")
-            if not _download(urls, p, MODEL_MIN_BYTES[name]):
+            if not _download(urls, p, MODEL_MIN_BYTES[name], MODEL_SHA256.get(name)):
                 raise RuntimeError(f"Model '{name}' tidak ditemukan dan gagal diunduh.\n"
                                    "Unduh manual dari salah satu tautan ini:\n  " + "\n  ".join(urls) +
                                    f"\nlalu simpan di folder: {MODEL_DIR}")
+        elif MODEL_SHA256.get(name) and _sha256(p) != MODEL_SHA256[name]:
+            print(f"PERINGATAN: {name} tidak sama dengan model acuan (SHA-256 berbeda). "
+                  "Hapus file itu agar diunduh ulang bila hasil pengenalan aneh.")
         paths.append(p)
     return paths
 
@@ -735,8 +754,12 @@ def report_spoof(t, source="main"):
     except OSError as e:
         print(f"[SPOOF] gagal menulis log: {e}")
     privacy.audit("spoof_terdeteksi", cand, {"skor_live": round(skor, 3), "sumber": source})
+    lv, det = t.live, ""
+    if lv is not None and lv.last_probs is not None:
+        p = lv.last_probs
+        det = f"  [kertas {p[0]:.2f} | asli {p[1]:.2f} | layar {p[2]:.2f}; wajah {lv.last_w:.0f}px]"
     print(f"[SPOOF] {now:%Y-%m-%d %H:%M:%S}  percobaan wajah palsu" + (f" (mirip {cand})" if cand else "")
-          + f"  skor asli {skor:.2f}")
+          + f"  skor asli {skor:.2f}" + det)
     return {"tipe": "spoof", "nama": cand, "id": "", "jam": now.strftime("%H:%M:%S"), "status": "ditolak",
             "skor_live": round(skor, 3)}
 

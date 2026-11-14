@@ -8,6 +8,8 @@
 
   "liveness_mode": "ganda",
   "liveness_thresh": 0.80,
+  "liveness_spoof_thresh": 0.50,
+  "liveness_min_px": 80,
   "liveness_min_frames": 3,
   "liveness_window": 8,
   "tantangan_ambang": 0.28,

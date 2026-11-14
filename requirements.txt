@@ -1,14 +1,3 @@
-# Inti
-opencv-python>=4.8
-numpy
-
-# Cloud sync (Firestore + Google Sheets)
-firebase-admin
-gspread
-
-# Opsional
-psutil      # tampilkan estimasi RAM di HUD
-openpyxl    # ekspor rekap ke .xlsx
 # Wajib
 opencv-python>=4.8        # YuNet, SFace, dnn (ONNX) - diuji dengan 4.x/5.0
 numpy>=1.23

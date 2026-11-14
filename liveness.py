@@ -157,6 +157,10 @@ class LivenessState:
         self.ch_fail = 0
         self.too_small = False
         self.hint = ""
+        self.uncertain = False       # zona abu-abu: belum cukup yakin asli, belum cukup yakin palsu
+        self.gate = ""               # alasan wajah belum dinilai (terlalu kecil / terpotong tepi layar)
+        self.last_probs = None       # [kertas, asli, layar] frame terakhir (diagnostik)
+        self.last_w = 0.0            # lebar wajah (px) frame terakhir yang dinilai
 
     @property
     def passed(self):
@@ -171,24 +175,37 @@ class LivenessState:
             if self.ch:
                 return CHALLENGES[self.ch["jenis"]] + (f" ({self.hint})" if self.hint else "")
         if not self.passive_ok:
+            if self.gate:
+                return self.gate
+            if self.uncertain:
+                return "Belum yakin: dekatkan wajah, hadap lurus, cahaya dari depan"
             return "Memeriksa keaslian wajah"
         return ""
 
     # ---- pasif ----
-    def add_score(self, sc):
+    def add_score(self, sc, probs=None):
+        """Perbarui keputusan pasif. Tiga keadaan (bukan dua):
+          LOLOS   rata-rata >= thresh (>= min_frames frame)               -> boleh dicatat
+          PALSU   jendela penuh dan rata-rata < spoof_thresh (bukti kuat)  -> dicap palsu, dilaporkan
+          RAGU    jendela penuh dan spoof_thresh <= rata-rata < thresh     -> TIDAK dicatat, TIDAK dicap
+                  palsu; terus dinilai dan pengguna diberi petunjuk. Syarat lolos tidak dilonggarkan,
+                  jadi keamanan sama, tetapi wajah asli tidak langsung dicap \"PALSU\".
+        Mengembalikan \"spoof\" sekali saat pertama kali dicap palsu."""
         if sc is None:
             return None
-        self.last = sc
+        self.last, self.last_probs = sc, probs
         self.scores.append(sc)
         self.mean = float(np.mean(self.scores))
-        ev = None
-        if len(self.scores) >= self.eng.min_frames and self.mean >= self.eng.thresh:
-            self.passive_ok, self.spoof = True, False
-        elif len(self.scores) >= self.eng.window and self.mean < self.eng.thresh:
-            self.spoof = True
+        n, ev = len(self.scores), None
+        if n >= self.eng.min_frames and self.mean >= self.eng.thresh:
+            self.passive_ok, self.spoof, self.uncertain = True, False, False
+        elif n >= self.eng.window and self.mean < self.eng.spoof_thresh:
+            self.spoof, self.uncertain = True, False
             if not self.spoof_reported:
                 self.spoof_reported = True
                 ev = "spoof"
+        elif n >= self.eng.window:
+            self.spoof, self.uncertain = False, True
         return ev
 
     # ---- aktif ----
@@ -237,6 +254,8 @@ class LivenessEngine:
         self.thresh = config.LIVENESS_THRESH
         self.min_frames = config.LIVENESS_MIN_FRAMES
         self.window = config.LIVENESS_WINDOW
+        self.spoof_thresh = config.LIVENESS_SPOOF_THRESH
+        self.min_px = config.LIVENESS_MIN_PX
         self.ch_thresh = config.TANTANGAN_AMBANG
         self.ch_timeout = config.TANTANGAN_TIMEOUT
         self.ch_min_px = config.TANTANGAN_MIN_PX
@@ -254,13 +273,26 @@ class LivenessEngine:
             return "liveness NONAKTIF (rentan foto/video!)"
         parts = []
         if self.passive:
-            parts.append(f"pasif MiniFASNet (ambang {self.thresh:.2f}, {self.min_frames}-{self.window} frame)")
+            parts.append(f"pasif MiniFASNet (lolos >= {self.thresh:.2f}, palsu < {self.spoof_thresh:.2f}, "
+                         f"{self.min_frames}-{self.window} frame, wajah >= {self.min_px}px)")
         if self.active:
             parts.append(f"aktif tengok kiri-kanan / dongak-tunduk (ambang {self.ch_thresh:.2f}, {self.ch_timeout} dtk)")
         return "liveness " + " + ".join(parts)
 
     def new_state(self):
         return LivenessState(self) if self.enabled else None
+
+    def gate(self, frame, box):
+        """\"\" bila wajah layak dinilai model pasif; selain itu alasan singkat untuk pengguna.
+        Wajah kecil (tekstur hilang saat di-resize ke 80x80) atau terpotong tepi layar menghasilkan skor
+        sembarang; menilainya hanya melahirkan penolakan palsu pada orang asli."""
+        H, W = frame.shape[:2]
+        x, y, w, h = (float(v) for v in box[:4])
+        if self.min_px and w < self.min_px:
+            return "Mendekat ke kamera"
+        if x < 2 or y < 2 or x + w > W - 2 or y + h > H - 2:
+            return "Posisikan seluruh wajah di dalam layar"
+        return ""
 
     def observe(self, st, frame, box_full, lm_full, now=None):
         """Perbarui status liveness dari satu deteksi segar. box_full / lm_full pada koordinat frame penuh.
@@ -271,7 +303,11 @@ class LivenessEngine:
         t0 = time.perf_counter()
         ev = None
         if self.passive is not None and (not st.passive_ok or st.spoof):
-            ev = st.add_score(self.passive.score(frame, box_full))
+            st.gate = self.gate(frame, box_full)
+            if not st.gate:
+                p = self.passive.probs(frame, box_full)
+                st.last_w = float(box_full[2])
+                ev = st.add_score(None if p is None else float(p[1]), p)
         if self.active and not st.active_ok and not st.spoof:
             st.too_small = box_full[2] < self.ch_min_px
             if not st.too_small:

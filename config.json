@@ -6,7 +6,7 @@
   "match_thresh": 0.40,
   "match_margin": 0.05,
 
-  "liveness_mode": "off",
+  "liveness_mode": "pasif",
   "liveness_thresh": 0.80,
   "liveness_min_frames": 3,
   "liveness_window": 8,

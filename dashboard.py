@@ -1351,7 +1351,7 @@ async function scanLoop(tok, id) {
       const w = Math.min(1280, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth);
       grab.width = w; grab.height = h;
       grab.getContext('2d').drawImage(v, 0, 0, w, h);
-      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.72));
+      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.95));
       try {
         const r = await fetch('/api/scan?cam=' + id, {method: 'POST', headers: {'Content-Type': 'image/jpeg', ...pinHeader()}, body: blob});
         const j = await r.json().catch(() => ({message: 'Respons server tidak valid'}));
@@ -1674,6 +1674,8 @@ SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DEN
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30        # detik: koneksi menggantung (slowloris) diputus, tidak menahan thread selamanya
+
     def log_message(self, *args):
         pass
 
@@ -1790,8 +1792,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, json.dumps({"ok": True, **out}), JSON)
         except ApiError as e:
             self.send(e.code, json.dumps({"ok": False, "message": e.msg, "rejected": e.rejected}), JSON)
-        except Exception as e:  # model/file bermasalah
-            self.send(500, json.dumps({"ok": False, "message": f"Gagal: {e}"}), JSON)
+        except Exception as e:  # model/file bermasalah: detail hanya di log server, bukan ke klien
+            print(f"[ERROR] {type(e).__name__}: {e}")
+            self.send(500, json.dumps({"ok": False, "message": "Terjadi kesalahan di server. Lihat log server."}), JSON)
 
     def scan(self):
         """Terima satu frame JPEG dari kamera browser, kembalikan wajah terdeteksi dan absen baru."""
@@ -1803,7 +1806,8 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             self.send(e.code, json.dumps({"ok": False, "message": e.msg}), JSON)
         except Exception as e:
-            self.send(500, json.dumps({"ok": False, "message": f"Gagal memindai: {e}"}), JSON)
+            print(f"[ERROR] scan: {type(e).__name__}: {e}")
+            self.send(500, json.dumps({"ok": False, "message": "Gagal memindai. Lihat log server."}), JSON)
 
     def do_POST(self):
         if urlparse(self.path).path == "/api/scan":
