@@ -894,11 +894,13 @@ th{font-size:13px;color:var(--mute);font-weight:500;position:sticky;top:0;backgr
 /* kamera */
 .camgrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:var(--gap);align-items:start}
 @media (max-width:900px){.camgrid{grid-template-columns:1fr}}
-.stage{position:relative;background:#0f0e0c;border-radius:var(--r-card);overflow:hidden;aspect-ratio:16/9;box-shadow:var(--shadow)}
+.stage{position:relative;background:var(--panel);border-radius:var(--r-card);overflow:hidden;aspect-ratio:16/9;max-height:82vh;max-height:82dvh;box-shadow:var(--shadow)}
 .stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%}
-.stage video{object-fit:contain;transform:scaleX(-1)}
-.stage:fullscreen{border-radius:0;aspect-ratio:auto}
-.idle{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:#e9e4da;padding:var(--s5)}
+.stage video{object-fit:cover}
+.stage video.mirror{transform:scaleX(-1)}
+.stage:fullscreen{border-radius:0;aspect-ratio:auto!important;max-height:none}
+@media (max-width:600px){.stage{aspect-ratio:3/4}}
+.idle{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:var(--ink);padding:var(--s5)}
 .idle .logo{margin:0 auto var(--s3);width:52px;height:52px;border-radius:16px}
 .pill{position:absolute;top:var(--s4);left:var(--s4);max-width:calc(100% - 32px);padding:var(--s2) var(--s4);border-radius:999px;background:rgba(20,18,15,.62);color:#fff;font-size:13px;font-weight:600;backdrop-filter:blur(8px)}
 .pill.err{background:rgba(180,35,24,.85);color:#fff}
@@ -927,7 +929,8 @@ pre.notice{white-space:pre-wrap;font:12.5px/1.5 "Plus Jakarta Sans",system-ui,sa
 .consent a{color:var(--acc)}
 .row{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin:var(--s2) 0}
 .row.end{justify-content:flex-end;margin-top:var(--s5)}
-video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner)}
+video.pv{display:block;width:100%;aspect-ratio:4/3;max-height:60vh;max-height:60dvh;object-fit:cover;background:var(--bg);border-radius:var(--r-inner)}
+video.pv.mirror{transform:scaleX(-1)}rder-radius:var(--r-inner)}
 .thumbs{display:flex;flex-wrap:wrap;gap:var(--s2);margin:var(--s2) 0}
 .th{position:relative}
 .th img{width:64px;height:64px;object-fit:cover;border-radius:var(--r-ctl);display:block}
@@ -1029,7 +1032,8 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
               <option value="server">Kamera server (seperti main.py)</option>
               <option value="browser">Kamera browser</option>
             </select>
-            <button class="btn pri" id="c-toggle" type="button">Mulai kamera</button>
+                       <button class="btn pri" id="c-toggle" type="button">Mulai kamera</button>
+            <button class="btn" id="c-flip" type="button" hidden><svg class="ic" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0113.7-5.6L20 8M20 4v4h-4M20 12a8 8 0 01-13.7 5.6L4 16M4 20v-4h4"/></svg>Putar kamera</button>
             <select id="c-dev" aria-label="Pilih kamera" hidden></select>
             <button class="btn" id="c-full" type="button"><svg class="ic" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>Layar penuh</button>
           </div>
@@ -1099,7 +1103,8 @@ video.pv{width:100%;max-height:260px;background:#000;border-radius:var(--r-inner
       <p id="d-prompt" class="mute">&nbsp;</p>
       <div class="row">
         <button class="btn" id="d-auto" type="button">Ambil 8 foto otomatis</button>
-        <button class="btn" id="d-snap" type="button">Ambil 1 foto</button>
+                <button class="btn" id="d-snap" type="button">Ambil 1 foto</button>
+        <button class="btn" id="d-flip" type="button">Putar kamera</button>
       </div>
     </div>
     <div class="thumbs" id="d-thumbs"></div>
@@ -1283,7 +1288,11 @@ $('export').onclick = async e => {
 };
 
 // ---------- kamera absen ----------
-const cam = {stream: null, on: false, tok: 0};
+const cam = {stream: null, on: false, tok: 0, facing: 'user', mirror: true, useDev: false};
+// stage mengikuti rasio asli gambar kamera, jadi tidak ada bar hitam (HP portrait maupun landscape)
+function fitStage(w, h) { if (w && h) $('stage').style.aspectRatio = w + ' / ' + h; }
+function resetStage() { $('stage').style.aspectRatio = ''; }
+function syncSrcUi() { $('c-flip').hidden = $('c-src').value !== 'browser'; }
 const srv = {on: false, tok: 0};
 const COL = {tercatat: '#16a34a', hadir: '#16a34a', cek: '#d97706', liveness: '#d97706', spoof: '#dc2626', unknown: '#dc2626', far: '#78716c'};
 const grab = document.createElement('canvas');
@@ -1317,14 +1326,21 @@ async function listDevices() {
 }
 
 // --- sumber: kamera browser (frame dikirim ke server) ---
-async function camStart() {
+async function camStart(flip) {
   if (!info.editable) { setPill('Kamera absen nonaktif: jalankan dashboard dengan --pin jika dibuka dari jaringan.', true); return; }
   if (!navigator.mediaDevices) { setPill('Kamera browser hanya tersedia di localhost atau HTTPS.', true); return; }
+  if (flip === true) { cam.facing = cam.facing === 'user' ? 'environment' : 'user'; cam.useDev = false; }
   camStop(true);
   try {
     const dev = $('c-dev').value;
-    cam.stream = await navigator.mediaDevices.getUserMedia({video: dev && !$('c-dev').hidden ? {deviceId: {exact: dev}} : {width: {ideal: 1280}, height: {ideal: 720}}});
-    const v = $('c-video'); v.srcObject = cam.stream; await v.play();
+    cam.stream = await navigator.mediaDevices.getUserMedia({audio: false, video: cam.useDev && dev
+      ? {deviceId: {exact: dev}}
+      : {facingMode: {ideal: cam.facing}, width: {ideal: 1280}, height: {ideal: 720}}});
+    const fm = cam.stream.getVideoTracks()[0].getSettings().facingMode;
+    cam.mirror = fm ? fm === 'user' : cam.facing === 'user';     // mirror hanya untuk kamera depan / webcam
+    const v = $('c-video'); v.classList.toggle('mirror', cam.mirror);
+    v.srcObject = cam.stream; await v.play();
+    fitStage(v.videoWidth, v.videoHeight);
   } catch (e) { setPill('Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai aplikasi lain).', true); return; }
   cam.on = true; const tok = ++cam.tok;
   const id = Math.random().toString(36).slice(2, 12);   // satu sesi pelacak di server per kamera aktif
@@ -1340,7 +1356,7 @@ function camStop(keepUi) {
   if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
   cam.stream = null; $('c-video').srcObject = null;
   const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
-  if (!keepUi) { $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera'; }
+    if (!keepUi) { $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = 'Mulai kamera'; resetStage(); }
 }
 
 async function scanLoop(tok, id) {
@@ -1348,6 +1364,7 @@ async function scanLoop(tok, id) {
     if (document.hidden) { await sleep(500); continue; }
     const v = $('c-video');
     if (v.videoWidth) {
+      fitStage(v.videoWidth, v.videoHeight);
       const w = Math.min(1280, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth);
       grab.width = w; grab.height = h;
       grab.getContext('2d').drawImage(v, 0, 0, w, h);
@@ -1372,11 +1389,12 @@ async function scanLoop(tok, id) {
   }
 }
 
-function layout() {
+function layout(vw, vh) {
   const c = $('c-canvas'), v = $('c-video'), dpr = window.devicePixelRatio || 1;
   const cw = c.clientWidth, ch = c.clientHeight;
   if (c.width !== Math.round(cw * dpr) || c.height !== Math.round(ch * dpr)) { c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr); }
-  const vw = v.videoWidth || 16, vh = v.videoHeight || 9, s = Math.min(cw / vw, ch / vh);
+  vw = vw || v.videoWidth || 16; vh = vh || v.videoHeight || 9;
+  const s = Math.max(cw / vw, ch / vh);                 // cover: memenuhi stage, tanpa bar hitam
   const dw = vw * s, dh = vh * s;
   return {dpr, cw, ch, ox: (cw - dw) / 2, oy: (ch - dh) / 2, dw, dh};
 }
@@ -1387,7 +1405,7 @@ function drawFaces(list) {
   g.font = '600 13px "Plus Jakarta Sans",system-ui,sans-serif'; g.textBaseline = 'middle';
   for (const f of list) {
     const [bx, by, bw, bh] = f.box;
-    const x = L.ox + (1 - bx - bw) * L.dw, y = L.oy + by * L.dh, w = bw * L.dw, h = bh * L.dh;   // video dicerminkan
+        const x = L.ox + (cam.mirror ? 1 - bx - bw : bx) * L.dw, y = L.oy + by * L.dh, w = bw * L.dw, h = bh * L.dh;
     const col = COL[f.status] || COL.unknown;
     const text = f.status === 'tercatat' ? `✓ ${f.nama} · Tercatat`
       : f.status === 'hadir' ? `${f.nama} · Sudah dikenali`
@@ -1437,7 +1455,8 @@ async function srvStop() {
   srv.on = false; srv.tok++;
   try { await api('POST', '/api/server-cam/stop', {}); } catch (e) { /* abaikan */ }
   const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
-  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera';
+#  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera';
+  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera'; resetStage();
 }
 
 async function srvLoop(tok) {
@@ -1450,11 +1469,10 @@ async function srvLoop(tok) {
       if (r.ok && r.status !== 204) {
         const bmp = await createImageBitmap(await r.blob());
         if (!srv.on || srv.tok !== tok) { bmp.close(); return; }
-        const L = layout(), g = $('c-canvas').getContext('2d');
-        const s = Math.min(L.cw / bmp.width, L.ch / bmp.height);
-        const dw = bmp.width * s, dh = bmp.height * s;
+        fitStage(bmp.width, bmp.height);
+        const L = layout(bmp.width, bmp.height), g = $('c-canvas').getContext('2d');
         g.setTransform(L.dpr, 0, 0, L.dpr, 0, 0); g.clearRect(0, 0, L.cw, L.ch);
-        g.drawImage(bmp, (L.cw - dw) / 2, (L.ch - dh) / 2, dw, dh); bmp.close();
+        g.drawImage(bmp, L.ox, L.oy, L.dw, L.dh); bmp.close();
       }
       if (Date.now() - lastStatus > 1000) {
         lastStatus = Date.now();
@@ -1481,8 +1499,10 @@ $('c-toggle').onclick = () => {
   else if (srv.on) srvStop();
   else if ($('c-src').value === 'server') srvStart(); else camStart();
 };
-$('c-src').onchange = () => { if (cam.on) camStop(); if (srv.on) srvStop(); };
-$('c-dev').onchange = () => cam.on && camStart();
+$('c-src').onchange = () => { if (cam.on) camStop(); if (srv.on) srvStop(); syncSrcUi(); };
+$('c-dev').onchange = () => { cam.useDev = true; if (cam.on) camStart(); };
+$('c-flip').onclick = () => camStart(true);
+syncSrcUi();
 $('c-full').onclick = () => { const s = $('stage'); document.fullscreenElement ? document.exitFullscreen() : s.requestFullscreen && s.requestFullscreen(); };
 
 // ---------- kelola wajah ----------
@@ -1572,12 +1592,19 @@ async function addFiles(files) {
   renderThumbs();
 }
 
-async function startCam() {
+const reg = {facing: 'user', mirror: true};
+async function startCam(flip) {
   $('d-err').textContent = '';
   if (!navigator.mediaDevices) { $('d-err').textContent = 'Kamera browser hanya tersedia di localhost atau HTTPS. Gunakan unggah foto.'; return; }
+  if (flip === true) reg.facing = reg.facing === 'user' ? 'environment' : 'user';
+  stopCam();
   try {
-    stream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 1280}, height: {ideal: 720}}});
-    $('d-video').srcObject = stream; await $('d-video').play(); $('d-camwrap').hidden = false;
+    stream = await navigator.mediaDevices.getUserMedia({audio: false, video: {facingMode: {ideal: reg.facing}, width: {ideal: 1280}, height: {ideal: 720}}});
+    const fm = stream.getVideoTracks()[0].getSettings().facingMode;
+    reg.mirror = fm ? fm === 'user' : reg.facing === 'user';
+    const v = $('d-video'); v.classList.toggle('mirror', reg.mirror);
+    v.srcObject = stream; await v.play(); $('d-camwrap').hidden = false;
+    if (v.videoWidth) v.style.aspectRatio = v.videoWidth + ' / ' + v.videoHeight;
   } catch (e) { $('d-err').textContent = 'Kamera tidak bisa dibuka (izin ditolak atau sedang dipakai). Gunakan unggah foto.'; }
 }
 
