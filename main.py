@@ -112,10 +112,12 @@ RTSP_RECONNECT_MAX = 15.0  # jeda maksimum (backoff x2)
 # umum, lebar wajah (px) ~ 177 / jarak (m); untuk 480p kira-kira separuhnya.
 # Format: (lebar kamera, tinggi kamera, lebar frame deteksi, lebar wajah minimum px, skor deteksi)
 # Catatan: lebar/tinggi kamera hanya dipakai untuk kamera lokal; RTSP memakai resolusi stream.
+# [PERUBAHAN] lebar wajah minimum dan skor deteksi dinaikkan agar embedding lebih andal
+# (wajah kecil / deteksi ragu = landmark meleset = alignment buruk = salah kenal).
 PROFIL = {
     "dekat":  (640, 480, 320, 80, 0.85),    # paling ringan, +-1 m
-    "sedang": (1280, 720, 480, 50, 0.80),   # +-3 m
-    "jauh":   (1280, 720, 640, 40, 0.70),   # +-4 m, akurasi menurun, butuh CPU lebih kuat
+    "sedang": (1280, 720, 480, 70, 0.85),   # +-2,5 m   (sebelumnya 50 px, 0.80)
+    "jauh":   (1280, 720, 640, 60, 0.80),   # +-3 m, akurasi menurun, butuh CPU lebih kuat (sebelumnya 40 px, 0.70)
 }
 PROFIL_AKTIF = "sedang"
 
@@ -129,12 +131,23 @@ CV_THREADS = 2             # batasi thread OpenCV agar CPU tidak penuh
 NMS_THRESH = 0.3
 MATCH_THRESH = config.MATCH_THRESH   # ambang skor orang (rata-rata 2 sampel terbaik); kalibrasi: evaluate.py
 MATCH_MARGIN = config.MATCH_MARGIN   # selisih minimum skor orang terbaik vs kedua (0 = nonaktif)
-CONFIRM_MATCHES = 2        # kecocokan beruntun yang dibutuhkan sebelum dianggap dikenali
+CONFIRM_MATCHES = 3        # kecocokan beruntun yang dibutuhkan sebelum dianggap dikenali (sebelumnya 2)
 UNKNOWN_RETRY_DETIK = 0.4  # jeda ekstraksi embedding ulang untuk wajah yang belum dikenali
 RECHECK_DETIK = 60         # verifikasi ulang wajah yang sudah dikenali (0 = tidak pernah)
 TRACK_IOU_MIN = 0.25
 TRACK_MAX_MISSED = 4       # siklus deteksi tanpa terdeteksi sebelum track dibuang
 WEAK_TOLERANCE = 2         # skor buruk beruntun sebelum wajah yang sudah dikenali dianggap Unknown
+
+TRACK_TTL = 3.0            # detik tanpa deteksi: track dibuang (sesi browser / stall tidak mewariskan identitas)
+TRACK_REACQUIRE = 0.5      # track yang sempat hilang lalu muncul lagi setelah > ini detik = wajib verifikasi ulang
+TRACK_MAX_SHIFT = 0.35     # geser pusat maks per langkah optical flow (x lebar wajah)
+TRACK_VEC_SPREAD = 0.25    # selisih maks vektor flow tiap landmark dari median (x lebar wajah)
+TRACK_FB_ERR = 0.02        # galat forward-backward maks (x lebar wajah, minimal 1 px)
+TRACK_JUMP = 0.45          # pusat deteksi vs kotak track bergeser > ini (x lebar) = lompatan
+TRACK_SIZE_RATIO = 1.35    # lebar deteksi / kotak track di luar [1/x, x] = lompatan
+TRACK_AMBIG = 0.6          # IoU kandidat kedua >= rasio ini x IoU terbaik = pasangan ambigu
+CROWD_GAP = 1.6            # jarak pusat dua wajah < ini x lebar = keramaian
+CROWD_RECHECK_DETIK = 0.6  # jeda verifikasi embedding saat keramaian
 
 # Absensi
 # Jam terlambat / jam pulang / durasi minimum diatur terpusat di config.py (atau config.json / environment variable)
@@ -144,10 +157,19 @@ REG_SAMPLES = 8
 REG_INTERVAL = 0.7         # detik antar pengambilan sampel
 REG_MIN_FACE_PX = 90       # wajah harus cukup besar saat registrasi (kualitas embedding)
 REG_MIN_SHARP = 25.0       # variansi Laplacian minimum crop wajah 112x112 (di bawah ini = buram)
-REG_BRIGHT = (40, 225)     # rentang rata-rata kecerahan crop wajah yang diterima
+REG_BRIGHT = (70, 210)     # rentang rata-rata kecerahan crop wajah yang diterima (sebelumnya 40-225)
 REG_PROMPTS = ["Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan",
                "Dongak sedikit", "Tunduk sedikit", "Hadap lurus, rileks", "Senyum tipis",
                "Hadap lurus ke kamera", "Tengok sedikit ke kiri", "Tengok sedikit ke kanan"]
+
+# [BARU] Gerbang kualitas saat PENGENALAN (bukan registrasi). Frame yang tidak lolos TIDAK dicocokkan,
+# sehingga wajah gelap / buram / deteksi ragu tidak bisa salah dikenali sebagai orang lain.
+# Sesuaikan dengan kameramu: bila ruangan terang tetapi sering muncul "Cahaya kurang", turunkan
+# RECOG_BRIGHT[0] (mis. 45) atau RECOG_MIN_STD (mis. 15).
+RECOG_BRIGHT = (60, 215)   # rentang rata-rata kecerahan crop wajah 112x112
+RECOG_MIN_SHARP = 15.0     # variansi Laplacian minimum
+RECOG_MIN_STD = 22.0       # simpangan baku piksel minimum (wajah gelap/datar = kontras rendah)
+RECOG_MIN_DET = 0.85       # skor deteksi YuNet minimum (landmark andal -> alignment baik)
 
 WIN_RUN = "Absensi Wajah (Q / ESC = keluar)"
 WIN_REG = "Registrasi Wajah (Q / ESC = batal)"
@@ -430,6 +452,23 @@ def sample_quality(aligned):
     return None
 
 
+def recog_quality(aligned, det_score):
+    """[BARU] Gerbang kualitas saat PENGENALAN. Kembalikan alasan frame tidak layak dicocokkan (str)
+    atau None bila layak. Frame gelap/buram/deteksi ragu menghasilkan embedding yang 'dekat ke mana-mana',
+    sehingga wajah mirip mudah lolos sebagai orang lain (FAR naik)."""
+    if det_score < RECOG_MIN_DET:
+        return "Deteksi kurang yakin"
+    g = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    mean = float(g.mean())
+    if mean < RECOG_BRIGHT[0] or float(g.std()) < RECOG_MIN_STD:
+        return "Cahaya kurang"
+    if mean > RECOG_BRIGHT[1]:
+        return "Terlalu terang"
+    if float(cv2.Laplacian(g, cv2.CV_64F).var()) < RECOG_MIN_SHARP:
+        return "Gambar buram"
+    return None
+
+
 # ----------------------------- Database embedding -----------------------------
 class Database:
     """Embedding di RAM sebagai matriks float32 (N,128). File di disk TERENKRIPSI (privacy.py).
@@ -617,7 +656,7 @@ def _iou(a, b):
 
 
 class Track:
-    def __init__(self, tid, row):
+    def __init__(self, tid, row, now=None):
         self.id = tid
         self.name = None      # nama terkonfirmasi
         self.pid = ""
@@ -627,25 +666,45 @@ class Track:
         self.score = 0.0
         self.next_embed = 0.0  # waktu paling cepat untuk ekstraksi embedding berikutnya
         self.live = None       # liveness.LivenessState (dibuat saat pertama diproses)
-        self.update(row)
+        self.verify = False    # True: track mungkin pindah ke wajah lain -> identitas WAJIB diverifikasi ulang
+        self.crowded = False   # ada wajah lain berdekatan
+        self.seen = 0.0        # waktu deteksi segar terakhir
+        self.quality = ""      # [BARU] alasan frame terakhir ditolak gerbang kualitas (kosong = layak)
+        self.update(row, now)
 
-    def update(self, row):
+    def update(self, row, now=None):
         self.row = row                                   # baris deteksi segar
         self.box = row[:4].astype(np.float32)
         self.lm = row[4:14].reshape(5, 2).astype(np.float32)
         self.missed = 0
         self.fresh = True
+        self.seen = time.time() if now is None else now
+
+
+def _risky(t, f, iou, di, ti, now):
+    """True bila memasangkan deteksi f ke track t patut dicurigai (bisa jadi wajah orang lain)."""
+    w = max(float(t.box[2]), 1.0)
+    cd = float(np.hypot(f[0] + f[2] / 2 - t.box[0] - t.box[2] / 2,
+                        f[1] + f[3] / 2 - t.box[1] - t.box[3] / 2)) / w
+    ratio = float(f[2]) / w
+    other = max(np.delete(iou[di], ti).max(initial=0.0), np.delete(iou[:, ti], di).max(initial=0.0))
+    return (cd > TRACK_JUMP
+            or not (1 / TRACK_SIZE_RATIO <= ratio <= TRACK_SIZE_RATIO)
+            or (t.missed > 0 and now - t.seen > TRACK_REACQUIRE)
+            or (other >= 0.1 and other >= TRACK_AMBIG * float(iou[di, ti])))
 
 
 class Tracker:
-    """Pelacak ringan: optical flow pada 5 landmark di antara frame deteksi + pencocokan IoU."""
+    """Pelacak ringan: optical flow pada 5 landmark di antara frame deteksi + pencocokan IoU.
+    Setiap pasangan yang mencurigakan menandai track `verify` agar identitasnya dicek ulang segera."""
 
     def __init__(self):
         self.tracks = {}
         self._next = 1
 
     def advance(self, prev_gray, gray):
-        """Geser kotak tiap wajah mengikuti gerakan landmark (tanpa menjalankan detektor)."""
+        """Geser kotak tiap wajah mengikuti gerakan landmark. Flow yang tidak masuk akal DITOLAK:
+        kotak ditahan di posisi lama dan track ditandai verify."""
         if not self.tracks:
             return
         tl = list(self.tracks.values())
@@ -653,16 +712,34 @@ class Tracker:
         p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None, **LK_PARAMS)
         if p1 is None:
             return
-        p0, p1, ok = p0.reshape(-1, 2), p1.reshape(-1, 2), st.reshape(-1) == 1
+        pb, stb, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, p1, None, **LK_PARAMS)   # cek balik
+        p0, p1 = p0.reshape(-1, 2), p1.reshape(-1, 2)
+        ok = st.reshape(-1) == 1
+        if pb is None:
+            ok[:] = False
+        else:
+            wpt = np.repeat([max(float(t.box[2]), 1.0) for t in tl], 5)
+            fb = np.linalg.norm(pb.reshape(-1, 2) - p0, axis=1)
+            ok &= (stb.reshape(-1) == 1) & (fb < np.maximum(TRACK_FB_ERR * wpt, 1.0))
         for i, t in enumerate(tl):
             s = slice(i * 5, i * 5 + 5)
-            if ok[s].sum() >= 3:
-                d = np.median(p1[s][ok[s]] - p0[s][ok[s]], axis=0)
-                t.box[:2] += d
-                t.lm += d
+            good = ok[s]
+            if good.sum() < 3:
+                continue                                   # terlalu sedikit titik andal: tahan posisi
+            vec = (p1[s] - p0[s])[good]
+            d = np.median(vec, axis=0)
+            w = max(float(t.box[2]), 1.0)
+            if np.linalg.norm(d) > TRACK_MAX_SHIFT * w or np.abs(vec - d).max() > TRACK_VEC_SPREAD * w:
+                t.verify = True                            # lompat / titik saling bertentangan
+                continue
+            t.box[:2] += d
+            t.lm += d
 
-    def update(self, faces):
+    def update(self, faces, now=None):
         """Cocokkan deteksi baru dengan track; kembalikan track yang mendapat deteksi segar."""
+        now = time.time() if now is None else now
+        for tid in [k for k, t in self.tracks.items() if now - t.seen > TRACK_TTL]:
+            del self.tracks[tid]                           # track basi tidak boleh mewariskan identitas
         tl = list(self.tracks.values())
         for t in tl:
             t.fresh = False
@@ -677,7 +754,11 @@ class Tracker:
                     break
                 if di in used_d or ti in used_t:
                     continue
-                tl[ti].update(faces[di].copy())
+                t = tl[ti]
+                risky = _risky(t, faces[di], iou, di, ti, now)   # hitung SEBELUM update menimpa kotak
+                t.update(faces[di].copy(), now)
+                if risky:
+                    t.verify, t.next_embed = True, 0.0           # embed pada siklus ini juga
                 used_d.add(di)
                 used_t.add(ti)
         fresh = [tl[i] for i in used_t]
@@ -688,11 +769,22 @@ class Tracker:
                     del self.tracks[t.id]
         for di, f in enumerate(faces):
             if di not in used_d:
-                t = Track(self._next, f.copy())
+                t = Track(self._next, f.copy(), now)
                 self._next += 1
                 self.tracks[t.id] = t
                 fresh.append(t)
+        self._flag_crowd(now)
         return fresh
+
+    def _flag_crowd(self, now):
+        """Wajah berdekatan: perpendek jeda verifikasi (60 dtk -> CROWD_RECHECK_DETIK)."""
+        ts = [t for t in self.tracks.values() if t.missed <= 1]
+        for a in ts:
+            ca = a.box[:2] + a.box[2:] / 2
+            lim = CROWD_GAP * max(float(a.box[2]), 1.0)
+            a.crowded = any(b is not a and np.linalg.norm(ca - (b.box[:2] + b.box[2:] / 2)) < lim for b in ts)
+            if a.crowded and a.name is not None:
+                a.next_embed = min(a.next_embed, now + CROWD_RECHECK_DETIK)
 
 
 # ----------------------------- Logika pengenalan -----------------------------
@@ -702,17 +794,27 @@ def _recheck_delay():
     return RECHECK_DETIK if RECHECK_DETIK > 0 else float("inf")
 
 
+def _drop_live(t):
+    """Wajah pada track ini berganti / identitasnya hilang: bukti keaslian lama tidak berlaku lagi."""
+    if t.live is not None:
+        t.live.reset()
+
+
 def apply_match(t, name, pid, score, now_t, logger, recheck):
     """Perbarui status track dari hasil pencocokan; catat absen bila sudah terkonfirmasi.
 
     Mengembalikan (datetime, tipe, status) bila ada catatan baru (masuk/pulang), selain itu None."""
     t.score = score
+    verifying, t.verify = t.verify, False      # track dicurigai pindah wajah: tanpa toleransi skor buruk
+    gap = min(recheck, CROWD_RECHECK_DETIK) if t.crowded else recheck
     if name is None or score < MATCH_THRESH:
-        if t.name is not None:
+        if t.name is not None and not verifying:
             t.weak += 1
             if t.weak < WEAK_TOLERANCE:   # toleransi satu frame buruk pada wajah yang sudah dikenali
                 t.next_embed = now_t + UNKNOWN_RETRY_DETIK
                 return None
+        if t.name is not None or verifying:
+            _drop_live(t)                 # identitas hilang: wajah berikutnya di track ini bukan "dia" lagi
         t.name, t.cand, t.cand_n, t.weak = None, None, 0, 0
         t.next_embed = now_t + UNKNOWN_RETRY_DETIK
         return None
@@ -720,6 +822,8 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
     if name == t.name:
         t.cand, t.cand_n = name, CONFIRM_MATCHES
     else:
+        if t.name is not None or (t.cand is not None and t.cand != name):
+            _drop_live(t)                 # orang berbeda di track yang sama: JANGAN warisi liveness
         t.name = None
         t.cand_n = t.cand_n + 1 if t.cand == name else 1
         t.cand = name
@@ -730,7 +834,7 @@ def apply_match(t, name, pid, score, now_t, logger, recheck):
     if t.live is not None and not t.live.passed:   # dikenali, tetapi BELUM lolos uji keaslian
         t.next_embed = now_t + UNKNOWN_RETRY_DETIK  # dicek lagi segera setelah liveness lolos
         return None
-    t.next_embed = now_t + recheck
+    t.next_embed = now_t + gap
     dt = datetime.now()
     r = logger.try_log(name, pid, score, dt)
     if r:
@@ -787,7 +891,17 @@ def process_faces(faces, frame, scale, now_t, tracker, engine, db, logger, reche
                 if t.live.passed and t.name:      # baru lolos: catat sekarang, jangan tunggu jeda verifikasi
                     t.next_embed = 0.0
         if now_t >= t.next_embed:          # embedding hanya jika perlu
-            res = apply_match(t, *db.match(engine.embed(frame, t.row, scale)), now_t, logger, recheck)
+            aligned = engine.align(frame, t.row, scale)
+            bad = recog_quality(aligned, float(t.row[14]))   # [BARU] gerbang kualitas pengenalan
+            if bad:                        # jangan cocokkan frame jelek: lebih baik menunggu frame yang bagus
+                t.quality = bad
+                t.next_embed = now_t + UNKNOWN_RETRY_DETIK
+                if t.verify:               # track mungkin pindah wajah dan tidak bisa diverifikasi sekarang
+                    _drop_live(t)
+                    t.name, t.cand, t.cand_n = None, None, 0
+                continue
+            t.quality = ""
+            res = apply_match(t, *db.match(engine.feature(aligned)), now_t, logger, recheck)
             if res:
                 dt, tipe, st = res
                 events.append({"nama": t.name, "id": t.pid, "jam": dt.strftime("%H:%M:%S"),
@@ -806,6 +920,8 @@ def track_view(t):
         return "liveness", f"{t.name or t.cand}: {lv.prompt()}"
     if t.cand:
         return "cek", f"{t.cand}?"
+    if t.quality and not t.name:           # [BARU] frame ditolak gerbang kualitas: tampilkan alasannya
+        return "unknown", t.quality
     return "unknown", "Unknown"
 
 

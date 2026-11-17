@@ -142,25 +142,30 @@ class LandmarkRefiner:
 
 
 class LivenessState:
-    """Status liveness satu wajah yang dilacak (satu Track). Reset otomatis saat track hilang."""
+    """Status liveness satu wajah yang dilacak (satu Track)."""
 
     def __init__(self, eng):
         self.eng = eng
+        self.reset()
+
+    def reset(self):
+        """Buang semua bukti keaslian. Dipanggil saat wajah pada track berganti orang / identitas hilang."""
+        eng = self.eng
         self.scores = deque(maxlen=eng.window)
         self.passive_ok = eng.passive is None
         self.active_ok = not eng.active
         self.spoof = False
         self.spoof_reported = False
-        self.last = None             # skor pasif terakhir
+        self.last = None
         self.mean = None
-        self.ch = None               # tantangan aktif: {"jenis", "mulai", "u": [...], "v": [...]}
+        self.ch = None
         self.ch_fail = 0
         self.too_small = False
         self.hint = ""
-        self.uncertain = False       # zona abu-abu: belum cukup yakin asli, belum cukup yakin palsu
-        self.gate = ""               # alasan wajah belum dinilai (terlalu kecil / terpotong tepi layar)
-        self.last_probs = None       # [kertas, asli, layar] frame terakhir (diagnostik)
-        self.last_w = 0.0            # lebar wajah (px) frame terakhir yang dinilai
+        self.uncertain = False
+        self.gate = ""
+        self.last_probs = None
+        self.last_w = 0.0 # lebar wajah (px) frame terakhir yang dinilai
 
     @property
     def passed(self):
