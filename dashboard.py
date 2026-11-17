@@ -930,7 +930,7 @@ pre.notice{white-space:pre-wrap;font:12.5px/1.5 "Plus Jakarta Sans",system-ui,sa
 .row{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin:var(--s2) 0}
 .row.end{justify-content:flex-end;margin-top:var(--s5)}
 video.pv{display:block;width:100%;aspect-ratio:4/3;max-height:60vh;max-height:60dvh;object-fit:cover;background:var(--bg);border-radius:var(--r-inner)}
-video.pv.mirror{transform:scaleX(-1)}rder-radius:var(--r-inner)}
+video.pv.mirror{transform:scaleX(-1)}
 .thumbs{display:flex;flex-wrap:wrap;gap:var(--s2);margin:var(--s2) 0}
 .th{position:relative}
 .th img{width:64px;height:64px;object-fit:cover;border-radius:var(--r-ctl);display:block}
@@ -1455,7 +1455,6 @@ async function srvStop() {
   srv.on = false; srv.tok++;
   try { await api('POST', '/api/server-cam/stop', {}); } catch (e) { /* abaikan */ }
   const c = $('c-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height);
-#  $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera';
   $('c-idle').hidden = false; setPill(''); $('c-toggle').textContent = info.rtsp ? 'Tonton CCTV' : 'Mulai kamera'; resetStage();
 }
 
@@ -1668,7 +1667,8 @@ $('k-rows').onclick = e => {
   if (b.dataset.a === 'del') del(p); else openDlg(b.dataset.a, p);
 };
 $('d-file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
-$('d-cam').onclick = startCam; $('d-snap').onclick = snap; $('d-auto').onclick = autoSnap;
+$('d-cam').onclick = () => startCam(false); $('d-flip').onclick = () => startCam(true);
+$('d-snap').onclick = snap; $('d-auto').onclick = autoSnap;
 $('d-thumbs').onclick = e => { const b = e.target.closest('button[data-rm]'); if (b) { imgs.splice(+b.dataset.rm, 1); renderThumbs(); } };
 $('d-save').onclick = save; $('d-cancel').onclick = () => $('dlg').close();
 $('dlg').addEventListener('close', stopCam);
