@@ -935,6 +935,23 @@ video.pv.mirror{transform:scaleX(-1)}
 .th{position:relative}
 .th img{width:64px;height:64px;object-fit:cover;border-radius:var(--r-ctl);display:block}
 .th button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;padding:0;border-radius:50%;border:0;background:var(--bad);color:#fff;cursor:pointer}
+/* login popup, konfirmasi, dan toast */
+.app.locked{filter:blur(10px);pointer-events:none;user-select:none}
+#login{width:min(400px,92vw);text-align:center}
+#login::backdrop{background:rgba(20,18,15,.6);backdrop-filter:blur(6px)}
+#login .logo{margin:0 auto var(--s3);width:52px;height:52px;border-radius:16px}
+#login h2{margin-bottom:var(--s1)}
+#login label{text-align:left;margin-top:var(--s4)}
+#login label.chk{font-weight:500;margin-top:var(--s3)}
+#login input:not([type=checkbox]){height:44px;font-size:16px}
+#login .err{min-height:20px;margin-top:var(--s2);font-size:13.5px;text-align:left}
+#login .btn.pri{width:100%;height:44px;margin-top:var(--s2)}
+#cf{width:min(420px,92vw)}
+.btn.pri.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+.sfoot #logout{width:100%;margin-bottom:var(--s3)}
+.gtoast{position:fixed;left:50%;bottom:var(--s6);transform:translate(-50%,16px);opacity:0;pointer-events:none;transition:.25s;z-index:100;max-width:min(560px,92vw);padding:var(--s3) var(--s5);border-radius:14px;background:var(--ink);color:var(--bg);font-weight:600;box-shadow:var(--shadow)}
+.gtoast.show{opacity:1;transform:translate(-50%,0)}
+.gtoast.bad{background:var(--bad);color:#fff}
 </style>
 </head>
 <body>
@@ -954,7 +971,7 @@ video.pv.mirror{transform:scaleX(-1)}
       <a href="/privasi" target="_blank" rel="noopener"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>Naskah privasi</a>
     </nav>
     <div class="sfoot">
-      <label id="pinbox" hidden>PIN admin <input type="password" id="pin" autocomplete="off"></label>
+      <button class="btn sm" id="logout" type="button" hidden><svg class="ic" viewBox="0 0 24 24"><path d="M9 4H5v16h4M16 8l4 4-4 4M20 12H9"/></svg>Keluar</button>
       <div class="seg" role="group" aria-label="Tema tampilan">
         <button type="button" data-theme-btn="auto" title="Otomatis (ikut sistem)" aria-label="Tema otomatis"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
         <button type="button" data-theme-btn="light" title="Terang" aria-label="Tema terang"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></svg></button>
@@ -1082,6 +1099,26 @@ video.pv.mirror{transform:scaleX(-1)}
   </main>
 </div>
 
+<dialog id="login" aria-labelledby="lg-title">
+  <span class="logo"><svg class="ic" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></svg></span>
+  <h2 id="lg-title">Masuk Admin</h2>
+  <p class="mute">Masukkan PIN admin untuk membuka dashboard absensi.</p>
+  <label>PIN admin <input type="password" id="lg-pin" autocomplete="current-password" autofocus></label>
+  <label class="chk"><input type="checkbox" id="lg-show"> Tampilkan PIN</label>
+  <p class="err" id="lg-err" role="alert"></p>
+  <button class="btn pri" id="lg-go" type="button">Masuk</button>
+</dialog>
+
+<dialog id="cf" aria-labelledby="cf-t">
+  <h2 id="cf-t"></h2>
+  <p class="mute" id="cf-m"></p>
+  <div class="row end">
+    <button class="btn" id="cf-no" type="button">Batal</button>
+    <button class="btn pri danger" id="cf-yes" type="button">Ya</button>
+  </div>
+</dialog>
+<div class="gtoast" id="gt" role="status" aria-live="polite"></div>
+
 <dialog id="dlg" aria-labelledby="dlg-title">
   <h2 id="dlg-title">Tambah orang</h2>
   <label>Nama <input id="d-nama" maxlength="60" autocomplete="off"></label>
@@ -1130,14 +1167,61 @@ const INFO_DEFAULT = {people: [], editable: true, pin_required: false, min_sampl
 let view = 'ringkasan', data = null, info = {...INFO_DEFAULT}, pendingAdd = false;
 
 const pinHeader = () => { const p = sessionStorage.getItem('pin'); return p ? {'X-Pin': p} : {}; };
-const needPin = () => { $('pinbox').hidden = false; };
-let pinTimer = null;
-$('pin').value = sessionStorage.getItem('pin') || '';
-$('pin').addEventListener('input', e => {
-  sessionStorage.setItem('pin', e.target.value);
-  clearTimeout(pinTimer);
-  pinTimer = setTimeout(() => { load(); if (view === 'kelola') loadPeople(); }, 400);
-});
+
+// ---------- notifikasi & konfirmasi ----------
+let gtT = null;
+function toast(msg, err) {
+  const t = $('gt'); t.textContent = msg; t.className = 'gtoast show' + (err ? ' bad' : '');
+  clearTimeout(gtT); gtT = setTimeout(() => t.classList.remove('show'), err ? 6000 : 4500);
+}
+function ask(title, msg, yes) {
+  return new Promise(res => {
+    const d = $('cf');
+    $('cf-t').textContent = title; $('cf-m').textContent = msg; $('cf-yes').textContent = yes || 'Ya';
+    const end = v => { d.close(); res(v); };
+    $('cf-yes').onclick = () => end(true); $('cf-no').onclick = () => end(false); d.oncancel = () => res(false);
+    d.showModal(); $('cf-no').focus();
+  });
+}
+
+// ---------- login PIN lewat popup ----------
+const appEl = document.querySelector('.app');
+function syncAuthUi() { $('logout').hidden = !(info.pin_required && sessionStorage.getItem('pin')); }
+function needPin(msg) {
+  info.pin_required = true;
+  const d = $('login');
+  appEl.classList.add('locked'); $('logout').hidden = true;
+  if (!d.open) { $('lg-pin').value = ''; $('lg-err').textContent = msg || ''; d.showModal(); }
+  else if (msg) $('lg-err').textContent = msg;
+  $('lg-pin').focus();
+}
+async function doLogin() {
+  const pin = $('lg-pin').value;
+  if (!pin) { $('lg-err').textContent = 'Masukkan PIN terlebih dahulu.'; $('lg-pin').focus(); return; }
+  $('lg-go').disabled = true; $('lg-go').textContent = 'Memeriksa...';
+  try {
+    const r = await fetch('/api/auth', {cache: 'no-store', headers: {'X-Pin': pin}});
+    if (r.ok) {
+      sessionStorage.setItem('pin', pin);
+      $('login').close(); appEl.classList.remove('locked'); syncAuthUi();
+      toast('Berhasil masuk. Selamat datang, Admin.');
+      load(); if (view === 'kelola' || view === 'kamera') loadPeople(); if (view === 'kamera') autoWatch();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      $('lg-err').textContent = j.message || 'PIN salah.';
+      $('lg-pin').select();
+    }
+  } catch (e) { $('lg-err').textContent = 'Server tidak terjangkau.'; }
+  $('lg-go').disabled = false; $('lg-go').textContent = 'Masuk';
+}
+$('lg-go').onclick = doLogin;
+$('lg-pin').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('lg-show').onchange = e => { $('lg-pin').type = e.target.checked ? 'text' : 'password'; };
+$('login').addEventListener('cancel', e => e.preventDefault());   // popup login tidak bisa ditutup dengan Esc
+$('logout').onclick = async () => {
+  camStop(); await srvStop();
+  sessionStorage.removeItem('pin'); data = null; needPin();
+};
 
 // ---------- tema ----------
 function applyTheme(t, save) {
@@ -1182,8 +1266,12 @@ async function load() {
   const date = view === 'kamera' ? today() : dateEl.value;
   try {
     const r = await fetch('/api/data?date=' + date, {cache: 'no-store', headers: pinHeader()});
-    if (r.status === 401) { needPin(); $('status').textContent = 'Masukkan PIN admin'; $('dot').className = 'dot'; return; }
-    if (r.status === 429) { needPin(); $('status').textContent = (await r.json()).message; $('dot').className = 'dot'; return; }
+    if (r.status === 401 || r.status === 429) {
+      const m = (await r.json().catch(() => ({}))).message || '';
+      sessionStorage.removeItem('pin');
+      needPin(m === 'PIN diperlukan.' ? '' : m);
+      $('status').textContent = 'Perlu masuk'; $('dot').className = 'dot'; return;
+    }
     if (!r.ok) throw new Error(r.status);
     data = await r.json();
     draw();
@@ -1270,14 +1358,14 @@ function drawFeed() {
 dateEl.addEventListener('change', load);
 $('q').addEventListener('input', () => data && drawPresent());
 $('r-q').addEventListener('input', () => data && drawRecap());
-setInterval(() => { if (!document.hidden && view !== 'kelola') load(); }, 4000);
+setInterval(() => { if (!document.hidden && view !== 'kelola' && !$('login').open) load(); }, 4000);
 
 // unduh CSV lewat fetch agar PIN ikut terkirim
 $('export').onclick = async e => {
   e.preventDefault();
   try {
     const r = await fetch('/export?date=' + dateEl.value, {headers: pinHeader(), cache: 'no-store'});
-    if (r.status === 401) { needPin(); throw new Error('Masukkan PIN admin di sidebar.'); }
+    if (r.status === 401) { needPin(); throw new Error('Masuk terlebih dahulu.'); }
     if (!r.ok) throw new Error('Gagal mengunduh (' + r.status + ')');
     const url = URL.createObjectURL(await r.blob());
     const a = document.createElement('a');
@@ -1514,17 +1602,23 @@ function say(t, err) { const m = $('k-msg'); m.textContent = t; m.className = 'n
 async function api(method, path, body) {
   const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', ...pinHeader()}, body: JSON.stringify(body)});
   const j = await r.json().catch(() => ({message: 'Respons server tidak valid'}));
-  if (!r.ok) { const e = new Error(j.message || r.status); e.rejected = j.rejected || []; throw e; }
+  if (!r.ok) {
+    if ((r.status === 403 || r.status === 429) && /PIN/.test(j.message || '')) { sessionStorage.removeItem('pin'); needPin('Sesi berakhir. Masuk kembali.'); }
+    const e = new Error(j.message || r.status); e.rejected = j.rejected || []; throw e;
+  }
   return j;
 }
 
 async function loadPeople() {
   try {
     const r = await fetch('/api/people', {cache: 'no-store', headers: pinHeader()});
-    if (r.status === 401) { needPin(); say('Masukkan PIN admin di sidebar.', true); return; }
+    if (r.status === 401 || r.status === 429) {
+      const m = (await r.json().catch(() => ({}))).message || '';
+      sessionStorage.removeItem('pin'); needPin(m === 'PIN diperlukan.' ? '' : m); return;
+    }
     info = {...info, ...(await r.json())};
   } catch (e) { say('Server tidak terjangkau', true); return; }
-  $('pinbox').hidden = !info.pin_required;
+  syncAuthUi();
   $('k-add').disabled = !info.editable;
   $('k-count').textContent = `${info.people.length} orang`;
   $('k-rows').innerHTML = info.people.map((p, i) => {
@@ -1572,6 +1666,7 @@ function openDlg(m, p) {
   $('d-err').textContent = ''; $('d-camwrap').hidden = true; $('d-prompt').innerHTML = '&nbsp;';
   renderThumbs();
   $('dlg').showModal();
+  if (m === 'add' || m === 'edit') $('d-nama').focus();
 }
 
 async function fileToJpeg(f) {
@@ -1644,7 +1739,8 @@ async function save() {
       : mode === 'consent' ? await api('POST', '/api/consent', {nama: target.nama, ...cons})
       : await api('PUT', '/api/people', {nama: target.nama, nama_baru: nama, id});
     $('dlg').close();
-    say(j.message + (j.warning ? ' ' + j.warning : '') + (j.rejected && j.rejected.length ? ' Ditolak: ' + j.rejected.join('; ') + '.' : ''));
+    toast(j.message + (j.warning ? ' ' + j.warning : '') + (j.rejected && j.rejected.length ? ' Ditolak: ' + j.rejected.join('; ') + '.' : ''),
+          !!(j.warning || (j.rejected && j.rejected.length)));
     loadPeople();
   } catch (e) {
     $('d-err').textContent = e.message + (e.rejected && e.rejected.length ? ' (' + e.rejected.join('; ') + ')' : '');
@@ -1653,8 +1749,8 @@ async function save() {
 }
 
 async function del(p) {
-  if (!confirm(`Hapus ${p.nama} beserta ${p.sampel} sampel wajahnya? Data biometrik dimusnahkan dan persetujuan ditandai dihapus. Riwayat absensi tidak ikut terhapus.`)) return;
-  try { say((await api('DELETE', '/api/people', {nama: p.nama})).message); } catch (e) { say(e.message, true); }
+  if (!await ask(`Hapus ${p.nama}?`, `${p.sampel} sampel wajah akan dimusnahkan permanen dan persetujuan ditandai dihapus. Riwayat absensi tidak ikut terhapus.`, 'Ya, hapus')) return;
+  try { toast((await api('DELETE', '/api/people', {nama: p.nama})).message); } catch (e) { toast(e.message, true); }
   loadPeople();
 }
 
@@ -1672,8 +1768,12 @@ $('d-snap').onclick = snap; $('d-auto').onclick = autoSnap;
 $('d-thumbs').onclick = e => { const b = e.target.closest('button[data-rm]'); if (b) { imgs.splice(+b.dataset.rm, 1); renderThumbs(); } };
 $('d-save').onclick = save; $('d-cancel').onclick = () => $('dlg').close();
 $('dlg').addEventListener('close', stopCam);
+$('dlg').addEventListener('keydown', e => {      // Enter di kolom teks = Simpan
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT' && !['checkbox', 'file'].includes(e.target.type)) { e.preventDefault(); save(); }
+});
 fetch('/api/info', {cache: 'no-store'}).then(r => r.json()).then(j => {
-  info = {...info, ...j}; $('pinbox').hidden = !j.pin_required;
+  info = {...info, ...j}; syncAuthUi();
+  if (j.pin_required && !sessionStorage.getItem('pin')) needPin();
   applyRtspUi(); if (view === 'kamera') autoWatch();
 }).catch(() => {});
 route();
@@ -1740,12 +1840,14 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/info":      # publik: hanya status PIN, mode edit, dan apakah CCTV aktif
             return self.send(200, json.dumps({"pin_required": bool(PIN), "editable": EDIT_ENABLED,
                                               "rtsp": scanner.always, "liveness": config.LIVENESS_MODE}), JSON)
-        if u.path not in ("/api/people", "/api/data", "/export",
+        if u.path not in ("/api/people", "/api/data", "/export", "/api/auth",
                           "/api/server-cam/frame", "/api/server-cam/status"):
             return self.send(404, "Halaman tidak ditemukan", "text/plain; charset=utf-8")
         denied = self.pin_denied()     # data absensi ikut dilindungi PIN
         if denied:
             return self.send(denied[0], json.dumps({"ok": False, "message": denied[1]}), JSON)
+        if u.path == "/api/auth":      # lolos pin_denied = PIN benar (dipakai popup login)
+            return self.send(200, json.dumps({"ok": True}), JSON)
         if u.path == "/api/server-cam/frame":
             if not EDIT_ENABLED:
                 return self.send(403, "Nonaktif", "text/plain; charset=utf-8")
