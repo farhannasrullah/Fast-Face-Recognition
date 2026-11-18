@@ -1,0 +1,33 @@
+{
+  "konfigurasi": {
+    "match_thresh": 0.4,
+    "match_margin": 0.05,
+    "sampel_galeri_per_orang": 8,
+    "liveness_aktif": true
+  },
+  "komposisi_data": {
+    "individu_terdaftar": 1,
+    "sampel_uji_terdaftar": 40,
+    "individu_tidak_terdaftar": 1,
+    "sampel_uji_tidak_terdaftar": 35,
+    "sampel_uji_spoof": 25
+  },
+  "confusion_counts": {
+    "TP": 35,
+    "TN": 35,
+    "FP_impostor": 0,
+    "FP_mis_id": 0,
+    "FN": 5,
+    "Spoof_Rejected": 25
+  },
+  "metrik": {
+    "Precision (%)": 100.0,
+    "Recall (%)": 87.5,
+    "F1-Score (%)": 93.33,
+    "Akurasi Identifikasi (%)": 93.33,
+    "Kecepatan Inferensi per Siklus (detik)": 0.0631,
+    "FRR (%)": 12.5,
+    "FAR (%)": 0.0,
+    "Penolakan Wajah Palsu (%)": 100.0
+  }
+}

@@ -4,7 +4,7 @@ serviceAccount.json
 *-firebase-adminsdk-*.json
 cloud_config.json
 .env
-
+dataset_uji/
 # Data biometrik, kunci, dan data pribadi
 kunci/
 *.key

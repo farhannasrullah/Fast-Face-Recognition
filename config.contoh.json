@@ -1,13 +1,13 @@
 {
-  "jam_terlambat": "08:00",
-  "jam_pulang": "16:00",
-  "min_durasi_menit": 240,
+  "jam_terlambat": "09:00",
+  "jam_pulang": "11:00",
+  "min_durasi_menit": 60,
 
   "match_thresh": 0.40,
   "match_margin": 0.05,
 
-  "liveness_mode": "ganda",
-  "liveness_thresh": 0.80,
+  "liveness_mode": "pasif",
+  "liveness_thresh": 0.60,
   "liveness_spoof_thresh": 0.50,
   "liveness_min_px": 80,
   "liveness_min_frames": 3,
@@ -18,6 +18,6 @@
 
   "wajib_persetujuan": true,
   "retensi_hari": 365,
-  "pengendali": "Universitas Contoh - Fakultas Teknik",
-  "kontak_pdp": "pdp@contoh.ac.id / 0812-0000-0000"
+  "pengendali": "TK Islam Teladan Bina Fitrah",
+  "kontak_pdp": "admin@tkbinafitrah.sch.id"
 }
